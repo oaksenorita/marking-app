@@ -11,15 +11,10 @@ import base64
 # ==========================================
 # ★設定エリア
 # ==========================================
-# Gemini API Key (デフォルト)
 GEMINI_API_KEY_DEFAULT = "" 
-# Gemini Model Name
 GEMINI_MODEL_NAME = "gemini-flash-latest"
-# OpenAI Model Name
 OPENAI_MODEL_NAME = "gpt-4o-mini"
-# 為替レート
 USD_JPY_RATE = 155.0
-# OpenAI Cost
 COST_INPUT_PER_1M = 0.15
 COST_OUTPUT_PER_1M = 0.60
 
@@ -33,15 +28,19 @@ if "draft_text" not in st.session_state:
 if "total_cost_usd" not in st.session_state:
     st.session_state.total_cost_usd = 0.0
 
-# ★追加：画像キャッシュ
+# 画像キャッシュ
 if "student_img_cache" not in st.session_state:
     st.session_state.student_img_cache = []
 if "ref_img_cache" not in st.session_state:
     st.session_state.ref_img_cache = []
 
-# ★追加：直近の採点結果を保持する変数
+# 直近の採点結果
 if "latest_result" not in st.session_state:
     st.session_state.latest_result = None
+
+# ★追加：アップローダーを強制リセットするためのキー管理
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
 
 # デフォルトプロンプト
 DEFAULT_SYSTEM_PROMPT = """
@@ -104,7 +103,7 @@ def pil_to_base64(img):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key):
-    # 1. Gemini
+    # 1. Gemini Try
     try:
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
@@ -168,8 +167,8 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key):
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv14", page_icon="💮", layout="wide")
-    st.title("💮 添削くん v14 (結果表示修正版)")
+    st.set_page_config(page_title="添削くんv15", page_icon="🏫", layout="wide")
+    st.title("🏫 添削くん v15 (基準維持・再採点機能)")
 
     # --- サイドバー設定 ---
     with st.sidebar:
@@ -177,7 +176,7 @@ def main():
         try:
             default_gemini = st.secrets.get("GEMINI_API_KEY", GEMINI_API_KEY_DEFAULT)
             default_openai = st.secrets.get("OPENAI_API_KEY", "")
-        except (FileNotFoundError, Exception):
+        except:
             default_gemini = GEMINI_API_KEY_DEFAULT
             default_openai = ""
         
@@ -199,8 +198,9 @@ def main():
             st.session_state.draft_text = ""
             st.session_state.student_img_cache = [] 
             st.session_state.ref_img_cache = []
-            st.session_state.latest_result = None # ここもクリア
+            st.session_state.latest_result = None
             st.session_state.total_cost_usd = 0.0
+            st.session_state.uploader_key += 1 # キー更新でアップローダーもクリア
             st.rerun()
 
     if not gemini_key or gemini_key == "AIza...":
@@ -230,14 +230,35 @@ def main():
             st.markdown(st.session_state.latest_result)
             st.markdown("---")
             
-            # 「次の生徒へ」ボタン
-            if st.button("➡️ 次の生徒へ (入力をクリア)", type="primary", use_container_width=True):
-                # 状態をリセットして初期画面へ
-                st.session_state.draft_text = ""
-                st.session_state.student_img_cache = []
-                st.session_state.ref_img_cache = []
-                st.session_state.latest_result = None
-                st.rerun()
+            # --- 3つのアクションボタン ---
+            col_act1, col_act2, col_act3 = st.columns([1, 1, 1])
+            
+            # 1. 修正して再採点
+            with col_act1:
+                if st.button("↩️ 修正して再採点", use_container_width=True):
+                    # 結果だけ消して、テキスト編集画面に戻る
+                    st.session_state.latest_result = None
+                    st.rerun()
+            
+            # 2. 次の生徒へ（基準維持）
+            with col_act2:
+                if st.button("➡️ 次の生徒へ (基準維持)", type="primary", use_container_width=True):
+                    st.session_state.draft_text = ""
+                    st.session_state.student_img_cache = [] # 生徒画像クリア
+                    # st.session_state.ref_img_cache は消さない！
+                    st.session_state.latest_result = None
+                    st.session_state.uploader_key += 1 # アップローダーをリフレッシュ
+                    st.rerun()
+
+            # 3. 次の問題へ（全クリア）
+            with col_act3:
+                if st.button("🗑️ 次の問題へ (全クリア)", use_container_width=True):
+                    st.session_state.draft_text = ""
+                    st.session_state.student_img_cache = []
+                    st.session_state.ref_img_cache = [] # 基準もクリア
+                    st.session_state.latest_result = None
+                    st.session_state.uploader_key += 1 # アップローダーをリフレッシュ
+                    st.rerun()
 
         # ----------------------------------------------
         # Phase 1: 初期アップロード画面
@@ -248,17 +269,25 @@ def main():
             # 基準資料
             with col1:
                 st.subheader("1. 基準資料")
-                ref_files = st.file_uploader("基準", type=["jpg", "png", "pdf"], key="ref", accept_multiple_files=True)
-                if ref_files:
-                    with st.expander("プレビュー"):
-                        for f in ref_files:
-                            for img in process_uploaded_file(f):
-                                st.image(img, use_container_width=True)
+                
+                # キャッシュがある場合は表示
+                if st.session_state.ref_img_cache:
+                    st.success(f"📚 基準資料ロード済み ({len(st.session_state.ref_img_cache)}ページ)")
+                    with st.expander("現在読み込まれている基準資料を見る"):
+                        for img in st.session_state.ref_img_cache:
+                            st.image(img, use_container_width=True)
+                    st.caption("※新しいファイルをアップロードすると上書きされます")
+
+                # アップローダー (IDを固定して、リセットされないようにする)
+                ref_files = st.file_uploader("基準ファイル (追加・変更する場合)", type=["jpg", "png", "pdf"], key="ref", accept_multiple_files=True)
 
             # 生徒答案
             with col2:
                 st.subheader("2. 生徒の答案")
-                student_files = st.file_uploader("答案", type=["jpg", "png", "pdf"], key="student", accept_multiple_files=True)
+                # IDを動的にして、ボタンクリックでリセットできるようにする
+                student_key = f"student_{st.session_state.uploader_key}"
+                student_files = st.file_uploader("答案ファイル", type=["jpg", "png", "pdf"], key=student_key, accept_multiple_files=True)
+                
                 if student_files:
                     with st.expander("プレビュー", expanded=True):
                         for f in student_files:
@@ -270,18 +299,18 @@ def main():
             if student_files:
                 st.subheader("Step 1: 読み取り開始")
                 if st.button("① 読み取りを開始 (OCR)", type="primary", use_container_width=True):
-                    with st.spinner("画像を保存して読み取っています..."):
-                        # キャッシュ保存
+                    with st.spinner("画像を処理中..."):
+                        # 生徒画像は常に新規読み込み
                         st.session_state.student_img_cache = []
-                        st.session_state.ref_img_cache = []
-                        
                         for f in student_files:
                             st.session_state.student_img_cache.extend(process_uploaded_file(f))
                         
+                        # 基準画像: アップロードがあれば上書き、なければキャッシュ維持
                         if ref_files:
+                            st.session_state.ref_img_cache = [] # 上書きのためクリア
                             for f in ref_files:
                                 st.session_state.ref_img_cache.extend(process_uploaded_file(f))
-
+                        
                         # OCR実行
                         ocr_prompt = "画像の英文を、スペルミスを含めて忠実にそのままテキスト化してください。解説不要。"
                         text_res, model_used = call_ai_hybrid(
@@ -310,10 +339,10 @@ def main():
                 edited_text = st.text_area("答案テキスト", value=st.session_state.draft_text, height=600)
                 
                 # 戻るボタン
-                if st.button("↩️ 最初からやり直す"):
+                if st.button("↩️ 画像読み込みからやり直す"):
                     st.session_state.draft_text = ""
                     st.session_state.student_img_cache = []
-                    st.session_state.ref_img_cache = []
+                    # 基準は残すかどうか？→読み込み直しなら残して良い
                     st.rerun()
 
             with img_col:
@@ -327,8 +356,6 @@ def main():
             if st.button("② 添削を実行", type="primary", use_container_width=True):
                 if mode == "シンプル文字起こし（OCRのみ）":
                     st.success("完了！")
-                    st.text_area("結果", value=edited_text)
-                    # 文字起こしのみの場合はここでResultに入れて表示モードへ
                     st.session_state.latest_result = f"```text\n{edited_text}\n```"
                     st.rerun()
                 else:
@@ -337,6 +364,7 @@ def main():
                         if mode == "一般添削":
                             final_prompt = "英語講師として、以下のテキストを添削してください。"
                         
+                        # 基準資料モードなら基準画像を渡す
                         images_to_send = current_ref_images if (mode == "厳密採点（基準資料あり）" and current_ref_images) else current_student_images
 
                         text_res, model_used = call_ai_hybrid(
@@ -358,8 +386,9 @@ def main():
                             "result": full_result
                         })
                         
-                        # ★ここを変更: すぐ消さずに、結果表示変数に入れる
+                        # 結果表示用変数に入れて画面遷移
                         st.session_state.latest_result = full_result
+                        st.session_state.draft_text = edited_text # 修正後テキストを保存（再編集用）
                         st.rerun()
 
     # ==========================================
