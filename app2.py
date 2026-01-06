@@ -38,7 +38,7 @@ if "ref_img_cache" not in st.session_state:
 if "latest_result" not in st.session_state:
     st.session_state.latest_result = None
 
-# ★追加：アップローダーを強制リセットするためのキー管理
+# アップローダー制御用キー
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -102,14 +102,22 @@ def pil_to_base64(img):
     img.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key):
+def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text_label="テキスト情報"):
+    """
+    text_label引数を追加し、テキストが何を指すのか明示できるように改良
+    """
     # 1. Gemini Try
     try:
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        
+        # プロンプト構築
         request_content = [prompt_text]
         if text_input:
-            request_content.append(f"\n\n【テキスト情報】\n{text_input}")
+            # ラベルを使って明確に役割を示す
+            request_content.append(f"\n\n【{text_label}】\n{text_input}")
+        
+        # 画像を追加
         request_content.extend(images)
 
         safety_settings = {
@@ -137,7 +145,7 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key):
         messages = [{"role": "system", "content": prompt_text}]
         user_content = []
         if text_input:
-            user_content.append({"type": "text", "text": f"【テキスト情報】\n{text_input}"})
+            user_content.append({"type": "text", "text": f"【{text_label}】\n{text_input}"})
         else:
              user_content.append({"type": "text", "text": "以下の画像を処理してください。"})
 
@@ -167,8 +175,8 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key):
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv15", page_icon="🏫", layout="wide")
-    st.title("🏫 添削くん v15 (基準維持・再採点機能)")
+    st.set_page_config(page_title="添削くんv16", page_icon="📝", layout="wide")
+    st.title("📝 添削くん v16 (役割誤認修正版)")
 
     # --- サイドバー設定 ---
     with st.sidebar:
@@ -200,7 +208,7 @@ def main():
             st.session_state.ref_img_cache = []
             st.session_state.latest_result = None
             st.session_state.total_cost_usd = 0.0
-            st.session_state.uploader_key += 1 # キー更新でアップローダーもクリア
+            st.session_state.uploader_key += 1
             st.rerun()
 
     if not gemini_key or gemini_key == "AIza...":
@@ -215,49 +223,38 @@ def main():
     tab_main, tab_history = st.tabs(["📝 採点作業", "🕒 採点履歴"])
 
     # ==========================================
-    # タブ1: 作業エリア (状態遷移ロジック)
+    # タブ1: 作業エリア
     # ==========================================
     with tab_main:
         
         # ----------------------------------------------
-        # Phase 3: 結果表示モード (添削完了後)
+        # Phase 3: 結果表示モード
         # ----------------------------------------------
         if st.session_state.latest_result:
             st.success("🎉 添削が完了しました！")
-            
-            # 結果表示
             st.markdown("---")
             st.markdown(st.session_state.latest_result)
             st.markdown("---")
             
-            # --- 3つのアクションボタン ---
             col_act1, col_act2, col_act3 = st.columns([1, 1, 1])
-            
-            # 1. 修正して再採点
             with col_act1:
                 if st.button("↩️ 修正して再採点", use_container_width=True):
-                    # 結果だけ消して、テキスト編集画面に戻る
                     st.session_state.latest_result = None
                     st.rerun()
-            
-            # 2. 次の生徒へ（基準維持）
             with col_act2:
                 if st.button("➡️ 次の生徒へ (基準維持)", type="primary", use_container_width=True):
                     st.session_state.draft_text = ""
-                    st.session_state.student_img_cache = [] # 生徒画像クリア
-                    # st.session_state.ref_img_cache は消さない！
+                    st.session_state.student_img_cache = []
                     st.session_state.latest_result = None
-                    st.session_state.uploader_key += 1 # アップローダーをリフレッシュ
+                    st.session_state.uploader_key += 1
                     st.rerun()
-
-            # 3. 次の問題へ（全クリア）
             with col_act3:
                 if st.button("🗑️ 次の問題へ (全クリア)", use_container_width=True):
                     st.session_state.draft_text = ""
                     st.session_state.student_img_cache = []
-                    st.session_state.ref_img_cache = [] # 基準もクリア
+                    st.session_state.ref_img_cache = []
                     st.session_state.latest_result = None
-                    st.session_state.uploader_key += 1 # アップローダーをリフレッシュ
+                    st.session_state.uploader_key += 1
                     st.rerun()
 
         # ----------------------------------------------
@@ -265,29 +262,19 @@ def main():
         # ----------------------------------------------
         elif not st.session_state.draft_text:
             col1, col2 = st.columns(2)
-            
-            # 基準資料
             with col1:
                 st.subheader("1. 基準資料")
-                
-                # キャッシュがある場合は表示
                 if st.session_state.ref_img_cache:
                     st.success(f"📚 基準資料ロード済み ({len(st.session_state.ref_img_cache)}ページ)")
-                    with st.expander("現在読み込まれている基準資料を見る"):
+                    with st.expander("基準資料プレビュー"):
                         for img in st.session_state.ref_img_cache:
                             st.image(img, use_container_width=True)
-                    st.caption("※新しいファイルをアップロードすると上書きされます")
+                ref_files = st.file_uploader("基準ファイル (追加・変更)", type=["jpg", "png", "pdf"], key="ref", accept_multiple_files=True)
 
-                # アップローダー (IDを固定して、リセットされないようにする)
-                ref_files = st.file_uploader("基準ファイル (追加・変更する場合)", type=["jpg", "png", "pdf"], key="ref", accept_multiple_files=True)
-
-            # 生徒答案
             with col2:
                 st.subheader("2. 生徒の答案")
-                # IDを動的にして、ボタンクリックでリセットできるようにする
                 student_key = f"student_{st.session_state.uploader_key}"
                 student_files = st.file_uploader("答案ファイル", type=["jpg", "png", "pdf"], key=student_key, accept_multiple_files=True)
-                
                 if student_files:
                     with st.expander("プレビュー", expanded=True):
                         for f in student_files:
@@ -300,27 +287,25 @@ def main():
                 st.subheader("Step 1: 読み取り開始")
                 if st.button("① 読み取りを開始 (OCR)", type="primary", use_container_width=True):
                     with st.spinner("画像を処理中..."):
-                        # 生徒画像は常に新規読み込み
                         st.session_state.student_img_cache = []
                         for f in student_files:
                             st.session_state.student_img_cache.extend(process_uploaded_file(f))
                         
-                        # 基準画像: アップロードがあれば上書き、なければキャッシュ維持
                         if ref_files:
-                            st.session_state.ref_img_cache = [] # 上書きのためクリア
+                            st.session_state.ref_img_cache = []
                             for f in ref_files:
                                 st.session_state.ref_img_cache.extend(process_uploaded_file(f))
                         
-                        # OCR実行
                         ocr_prompt = "画像の英文を、スペルミスを含めて忠実にそのままテキスト化してください。解説不要。"
+                        # OCR時は生徒の答案のみを渡す
                         text_res, model_used = call_ai_hybrid(
                             prompt_text=ocr_prompt,
                             text_input="",
                             images=st.session_state.student_img_cache,
                             gemini_key=gemini_key,
-                            openai_key=openai_key
+                            openai_key=openai_key,
+                            text_label="画像"
                         )
-                        
                         st.session_state.draft_text = text_res
                         st.rerun()
 
@@ -329,7 +314,6 @@ def main():
         # ----------------------------------------------
         else:
             st.info("✅ 読み取り完了。誤りがないか確認・修正してください。")
-            
             current_student_images = st.session_state.student_img_cache
             current_ref_images = st.session_state.ref_img_cache
 
@@ -337,12 +321,9 @@ def main():
             with edit_col:
                 st.subheader("✏️ テキスト編集")
                 edited_text = st.text_area("答案テキスト", value=st.session_state.draft_text, height=600)
-                
-                # 戻るボタン
                 if st.button("↩️ 画像読み込みからやり直す"):
                     st.session_state.draft_text = ""
                     st.session_state.student_img_cache = []
-                    # 基準は残すかどうか？→読み込み直しなら残して良い
                     st.rerun()
 
             with img_col:
@@ -360,25 +341,50 @@ def main():
                     st.rerun()
                 else:
                     with st.spinner("AIが添削中..."):
-                        final_prompt = custom_prompt
-                        if mode == "一般添削":
-                            final_prompt = "英語講師として、以下のテキストを添削してください。"
                         
-                        # 基準資料モードなら基準画像を渡す
-                        images_to_send = current_ref_images if (mode == "厳密採点（基準資料あり）" and current_ref_images) else current_student_images
+                        # --- 修正ポイント: 役割定義を強化 ---
+                        final_prompt = custom_prompt
+                        images_to_send = []
+                        text_label = "採点対象テキスト"
 
+                        if mode == "厳密採点（基準資料あり）" and current_ref_images:
+                            # 厳密採点モードの場合
+                            # 1. プロンプトの先頭に強力な注意書きを追加
+                            instruction_prefix = """
+                            【⚠️ 重要指示：役割の厳格な区別】
+                            1. 以下の「生徒の答案（採点対象）」というテキストのみを採点してください。
+                            2. 添付されている画像はすべて「正解データ（基準資料）」です。
+                            3. **絶対に画像を採点しないでください。** 画像は正解として扱い、テキストと比較するために使ってください。
+                            """
+                            final_prompt = instruction_prefix + "\n" + custom_prompt
+                            
+                            # 2. 画像は基準資料のみを送る
+                            images_to_send = current_ref_images
+                            
+                            # 3. テキストラベルを明確化
+                            text_label = "生徒の答案（採点対象）"
+                            
+                        elif mode == "一般添削":
+                            final_prompt = "英語講師として、以下のテキストを添削してください。"
+                            images_to_send = current_student_images
+                            text_label = "生徒の答案テキスト"
+                        
+                        else: # フォールバック
+                            images_to_send = current_student_images
+
+                        # AI呼び出し
                         text_res, model_used = call_ai_hybrid(
                             prompt_text=final_prompt,
                             text_input=edited_text,
                             images=images_to_send,
                             gemini_key=gemini_key,
-                            openai_key=openai_key
+                            openai_key=openai_key,
+                            text_label=text_label # 明確化されたラベルを渡す
                         )
 
                         timestamp = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
                         full_result = f"### 📝 修正済み答案\n```text\n{edited_text}\n```\n\n### 🤖 AI ({model_used})\n{text_res}"
                         
-                        # 履歴保存
                         st.session_state.history.insert(0, {
                             "time": timestamp,
                             "title": f"結果 ({model_used})",
@@ -386,14 +392,10 @@ def main():
                             "result": full_result
                         })
                         
-                        # 結果表示用変数に入れて画面遷移
                         st.session_state.latest_result = full_result
-                        st.session_state.draft_text = edited_text # 修正後テキストを保存（再編集用）
+                        st.session_state.draft_text = edited_text
                         st.rerun()
 
-    # ==========================================
-    # タブ2: 履歴
-    # ==========================================
     with tab_history:
         st.subheader("🕒 採点履歴")
         if not st.session_state.history:
