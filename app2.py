@@ -46,13 +46,11 @@ if "uploader_key" not in st.session_state:
 if "question_registry" not in st.session_state:
     st.session_state.question_registry = {}
 
-# 適用中のルール・メモ
+# 適用中のルール・メモ・上書き削除フラグ
 if "active_rules" not in st.session_state:
     st.session_state.active_rules = None
 if "active_memos" not in st.session_state:
     st.session_state.active_memos = ""
-
-# ★追加: 上書き・削除確認用の状態変数
 if "pending_overwrite_data" not in st.session_state:
     st.session_state.pending_overwrite_data = None
 if "pending_delete_id" not in st.session_state:
@@ -186,10 +184,10 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv19", page_icon="💾", layout="wide")
-    st.title("💾 添削くん v19 (データ管理強化版)")
+    st.set_page_config(page_title="添削くんv20", page_icon="💬", layout="wide")
+    st.title("💬 添削くん v20 (基準プレビュー・追加質問)")
 
-    # --- サイドバー設定 ---
+    # --- サイドバー ---
     with st.sidebar:
         st.header("🔑 API設定")
         try:
@@ -210,21 +208,13 @@ def main():
         st.header("📥 データ管理")
         st.warning("【注意】ブラウザを閉じると登録データは消えます。必ず「設定ファイルを保存」してください。", icon="⚠️")
         
-        # JSON エクスポート
         if not st.session_state.question_registry:
             json_str = "{}"
         else:
             json_str = json.dumps(st.session_state.question_registry, ensure_ascii=False, indent=2)
             
-        st.download_button(
-            label="設定ファイルを保存 (Export)",
-            data=json_str,
-            file_name="marking_config.json",
-            mime="application/json",
-            help="現在の登録データをJSONファイルとしてダウンロードします"
-        )
+        st.download_button("設定ファイルを保存 (Export)", json_str, "marking_config.json", "application/json")
         
-        # JSON インポート
         uploaded_config = st.file_uploader("設定ファイルを読込 (Import)", type=["json"])
         if uploaded_config is not None:
             if st.button("読み込む"):
@@ -243,39 +233,34 @@ def main():
         if st.session_state.draft_text and st.session_state.active_memos:
             st.divider()
             st.info("📖 **この問題の採点メモ**")
-            st.text_area("参照用(コピー可)", value=st.session_state.active_memos, height=300, disabled=True)
+            st.text_area("参照用", value=st.session_state.active_memos, height=300, disabled=True)
 
     if not gemini_key or gemini_key == "AIza...":
         st.warning("APIキーを入力してください。")
         return
 
-    # --- タブ ---
-    tab_mark, tab_reg, tab_hist = st.tabs(["📝 採点・添削", "⚙️ 基準データ登録・編集", "🕒 履歴"])
+    tab_mark, tab_reg, tab_hist = st.tabs(["📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
     # ==========================================
-    # タブ2: 基準データ登録画面
+    # タブ2: 基準データ登録
     # ==========================================
     with tab_reg:
         st.subheader("1. 新しい問題の基準を登録")
-        
         col_r1, col_r2 = st.columns(2)
         with col_r1:
             r_univ = st.text_input("大学名", placeholder="例: 東京大学")
             r_year = st.text_input("年度", placeholder="例: 2025")
         with col_r2:
             r_qnum = st.text_input("大問・問番号", placeholder="例: 大問1 (A)")
-            # ★変更: multiple=Trueを維持。複数ファイルOK
             r_files = st.file_uploader("基準画像/PDF (複数可)", type=["jpg","png","pdf"], key="reg_files", accept_multiple_files=True)
 
         st.markdown("---")
         st.subheader("2. ルール設定")
-        
         col_rule1, col_rule2 = st.columns(2)
         with col_rule1:
             rule_slots = st.number_input("解答欄の数（0なら自動）", min_value=0, value=0)
             rule_ignore_grid = st.checkbox("格子線・枠線を無視する", value=False) 
             rule_ignore_header = st.checkbox("生徒情報ヘッダーを無視", value=True)
-        
         with col_rule2:
             rule_has_word_limit = st.checkbox("語数制限がある設問", help="採点時に手動チェック欄を表示します")
             rule_strict_space = st.checkbox("記述スペース狭小（コメント短め）")
@@ -286,31 +271,20 @@ def main():
         st.subheader("3. 採点メモ")
         rule_memos = st.text_area("自分用のメモ・コメント集", placeholder="・配点: 10点\n・よくあるミス...\n・コメント例...", height=150)
 
-        # ------------------------------------
-        # 登録・更新ロジック
-        # ------------------------------------
         if st.button("この内容で登録/更新する", type="primary"):
             if not (r_univ and r_year and r_qnum and r_files):
                 st.error("大学名・年度・番号・ファイルは必須です。")
             else:
                 unique_id = f"{r_univ}_{r_year}_{r_qnum}"
-                
-                # 上書き確認
                 if unique_id in st.session_state.question_registry:
-                    # 一時保存して確認画面へ
                     st.session_state.pending_overwrite_data = {
-                        "id": unique_id,
-                        "files": r_files, # file objects
-                        "rules": {
-                            "slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
-                            "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space,
-                            "custom": rule_custom, "memos": rule_memos
-                        },
+                        "id": unique_id, "files": r_files,
+                        "rules": {"slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
+                                  "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space, "custom": rule_custom, "memos": rule_memos},
                         "univ": r_univ, "year": r_year, "q_num": r_qnum
                     }
                     st.rerun()
                 else:
-                    # 新規登録
                     all_imgs = []
                     for f in r_files:
                         all_imgs.extend(process_uploaded_file(f))
@@ -319,57 +293,42 @@ def main():
                     st.session_state.question_registry[unique_id] = {
                         "univ": r_univ, "year": r_year, "q_num": r_qnum,
                         "images": b64_imgs,
-                        "rules": {
-                            "slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
-                            "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space,
-                            "custom": rule_custom, "memos": rule_memos
-                        }
+                        "rules": {"slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
+                                  "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space, "custom": rule_custom, "memos": rule_memos}
                     }
                     st.success(f"新規登録しました: {unique_id}")
         
-        # 上書き確認ダイアログ
         if st.session_state.pending_overwrite_data:
             st.warning(f"⚠️ データ『{st.session_state.pending_overwrite_data['id']}』は既に存在します。更新しますか？")
             col_conf1, col_conf2 = st.columns(2)
             if col_conf1.button("はい、更新します"):
                 data = st.session_state.pending_overwrite_data
-                # 画像処理
                 all_imgs = []
                 for f in data['files']:
                     all_imgs.extend(process_uploaded_file(f))
                 b64_imgs = [pil_to_base64(img) for img in all_imgs]
-
                 st.session_state.question_registry[data['id']] = {
                     "univ": data['univ'], "year": data['year'], "q_num": data['q_num'],
-                    "images": b64_imgs,
-                    "rules": data['rules']
+                    "images": b64_imgs, "rules": data['rules']
                 }
                 st.session_state.pending_overwrite_data = None
                 st.success("更新しました！")
                 st.rerun()
-                
             if col_conf2.button("キャンセル"):
                 st.session_state.pending_overwrite_data = None
                 st.rerun()
 
-        # ------------------------------------
-        # 削除・一覧表示ロジック
-        # ------------------------------------
         if st.session_state.question_registry:
             st.markdown("---")
             st.subheader("📚 登録データの管理・削除")
-            
-            # 一覧と削除用プルダウン
             reg_keys = list(st.session_state.question_registry.keys())
-            target_id = st.selectbox("登録済みデータ一覧 (削除する場合は選択して下のボタン)", reg_keys)
-            
+            target_id = st.selectbox("登録済みデータ一覧", reg_keys)
             if st.button("選択したデータを削除"):
                 st.session_state.pending_delete_id = target_id
                 st.rerun()
 
-            # 削除確認ダイアログ
             if st.session_state.pending_delete_id:
-                st.error(f"⚠️ 本当に『{st.session_state.pending_delete_id}』を削除しますか？この操作は元に戻せません。")
+                st.error(f"⚠️ 本当に『{st.session_state.pending_delete_id}』を削除しますか？")
                 col_del1, col_del2 = st.columns(2)
                 if col_del1.button("削除実行"):
                     del st.session_state.question_registry[st.session_state.pending_delete_id]
@@ -384,10 +343,72 @@ def main():
     # タブ1: 採点作業エリア
     # ==========================================
     with tab_mark:
+        # --- 現在の基準資料を特定 ---
+        current_ref_images_view = []
+        if st.session_state.registry_ref_img_cache:
+            current_ref_images_view = st.session_state.registry_ref_img_cache
+        else:
+            current_ref_images_view = st.session_state.ref_img_cache
+
+        # ------------------------------------
+        # Phase 3: 結果表示モード (追加質問機能)
+        # ------------------------------------
         if st.session_state.latest_result:
             st.success("🎉 添削完了")
             st.markdown("---")
             st.markdown(st.session_state.latest_result)
+            
+            # ★追加: 追加質問エリア
+            st.markdown("---")
+            st.subheader("💬 AIへの追加指示・質問")
+            st.caption("今の添削結果について、疑問点を聞いたり修正指示を出せます。")
+            
+            with st.form("followup_form"):
+                user_q = st.text_area("質問や指示を入力", placeholder="例: 問2の減点理由を詳しく教えて / 問1のスペルミスは見逃して再採点して")
+                submitted = st.form_submit_button("送信")
+                
+                if submitted and user_q:
+                    with st.spinner("AIと思考中..."):
+                        # 文脈を作る
+                        context_prompt = f"""
+                        あなたは英語教師です。先ほど以下の生徒の答案を添削しました。
+                        
+                        【これまでの添削結果】
+                        {st.session_state.latest_result}
+                        
+                        【ユーザーからの追加指示・質問】
+                        {user_q}
+                        
+                        上記の指示に従って、回答してください（修正が必要な場合は修正版の答案を出力し、質問への回答なら解説してください）。
+                        """
+                        
+                        # 画像（基準と生徒）も念のため送る（参照できるように）
+                        all_ref_imgs = current_ref_images_view
+                        # 生徒画像はキャッシュから
+                        all_student_imgs = st.session_state.student_img_cache
+                        
+                        imgs_to_send = all_ref_imgs # 基準を優先
+                        
+                        text_res, model_used = call_ai_hybrid(
+                            prompt_text=context_prompt,
+                            text_input="",
+                            images=imgs_to_send,
+                            gemini_key=gemini_key,
+                            openai_key=openai_key,
+                            text_label="以前の履歴"
+                        )
+                        
+                        # 結果に追記
+                        new_block = f"\n\n---\n### 💬 追加指示: {user_q}\n\n### 🤖 AI ({model_used})\n{text_res}"
+                        st.session_state.latest_result += new_block
+                        st.rerun()
+            
+            # ★追加: 基準資料プレビュー (アコーディオン)
+            if current_ref_images_view:
+                with st.expander("📚 基準資料・配点基準を確認する", expanded=False):
+                    for i, img in enumerate(current_ref_images_view):
+                        st.image(img, caption=f"基準-{i+1}", use_container_width=True)
+
             st.markdown("---")
             c1, c2, c3 = st.columns(3)
             if c1.button("↩️ 修正して再採点", use_container_width=True):
@@ -410,7 +431,9 @@ def main():
                 st.session_state.active_memos = ""
                 st.rerun()
 
-        # 入力モード
+        # ------------------------------------
+        # Phase 1: 入力モード
+        # ------------------------------------
         elif not st.session_state.draft_text:
             st.subheader("1. 基準データを選択")
             input_mode = st.radio("入力方法", ["登録データから呼び出す", "手動でアップロード"], horizontal=True)
@@ -422,23 +445,13 @@ def main():
                 else:
                     options = ["選択してください"] + list(st.session_state.question_registry.keys())
                     selected_id = st.selectbox("問題を選択", options)
-                    
                     if selected_id != "選択してください":
                         data = st.session_state.question_registry[selected_id]
                         selected_registry_data = data
-                        
                         st.info(f"選択中: {data['univ']} {data['year']} {data['q_num']}")
-                        rules = data['rules']
-                        rule_txts = []
-                        if rules['slots'] > 0: rule_txts.append(f"解答欄{rules['slots']}つ")
-                        if rules['ignore_grid']: rule_txts.append("格子線無視")
-                        if rules.get('has_word_limit', False): rule_txts.append("語数制限あり")
-                        st.caption(f"ルール: {', '.join(rule_txts) if rule_txts else 'なし'}")
-
                         if not st.session_state.registry_ref_img_cache:
                             imgs = [base64_to_pil(b64) for b64 in data['images']]
                             st.session_state.registry_ref_img_cache = imgs
-                            
                         with st.expander("基準画像を確認"):
                             for img in st.session_state.registry_ref_img_cache:
                                 st.image(img, use_container_width=True)
@@ -463,7 +476,6 @@ def main():
             if student_files:
                 if st.button("① 読み取りを開始 (OCR)", type="primary", use_container_width=True):
                     with st.spinner("ルールに基づいて読み取り中..."):
-                        
                         if selected_registry_data:
                             st.session_state.active_rules = selected_registry_data['rules']
                             st.session_state.active_memos = selected_registry_data['rules'].get('memos', "")
@@ -476,7 +488,6 @@ def main():
                             st.session_state.student_img_cache.extend(process_uploaded_file(f))
                         
                         ocr_prompt = "画像の英文を、スペルミスを含めて忠実にそのままテキスト化してください。解説不要。\n"
-                        
                         if selected_registry_data:
                             rules = selected_registry_data['rules']
                             if rules['ignore_grid']:
@@ -487,23 +498,17 @@ def main():
                                 ocr_prompt += f"【重要】設問は(1)〜({rules['slots']})のような形式で{rules['slots']}つあります。それ以外の余計な情報は読み取らないでください。\n"
                         
                         text_res, model_used = call_ai_hybrid(
-                            prompt_text=ocr_prompt,
-                            text_input="",
-                            images=st.session_state.student_img_cache,
-                            gemini_key=gemini_key,
-                            openai_key=openai_key,
-                            text_label="画像"
+                            prompt_text=ocr_prompt, text_input="", images=st.session_state.student_img_cache,
+                            gemini_key=gemini_key, openai_key=openai_key, text_label="画像"
                         )
                         st.session_state.draft_text = text_res
                         st.rerun()
 
+        # ------------------------------------
         # Phase 2: 確認・修正画面
+        # ------------------------------------
         else:
             st.info("✅ 読み取り完了。確認してください。")
-            if st.session_state.registry_ref_img_cache:
-                current_ref_images = st.session_state.registry_ref_img_cache
-            else:
-                current_ref_images = st.session_state.ref_img_cache
             current_student_images = st.session_state.student_img_cache
 
             edit_col, img_col = st.columns([1, 1])
@@ -522,14 +527,22 @@ def main():
                     st.rerun()
 
             with img_col:
-                for i, img in enumerate(current_student_images):
-                    st.image(img, caption=f"Img {i+1}", use_container_width=True)
+                # ★変更: タブで基準資料も見れるようにする
+                tab_s_view, tab_r_view = st.tabs(["🔍 生徒の答案", "📚 基準・配点資料"])
+                with tab_s_view:
+                    for i, img in enumerate(current_student_images):
+                        st.image(img, caption=f"生徒答案-{i+1}", use_container_width=True)
+                with tab_r_view:
+                    if current_ref_images_view:
+                        for i, img in enumerate(current_ref_images_view):
+                            st.image(img, caption=f"基準資料-{i+1}", use_container_width=True)
+                    else:
+                        st.warning("基準資料が読み込まれていません")
 
             st.divider()
             
             if st.button("② 添削を実行", type="primary", use_container_width=True):
                 with st.spinner("ルールに基づいて添削中..."):
-                    
                     instruction_prefix = """
                     【⚠️ 重要指示：役割の厳格な区別】
                     1. 以下の「生徒の答案（採点対象）」というテキストのみを採点してください。
@@ -542,7 +555,6 @@ def main():
                         rules = st.session_state.active_rules
                         if failed_word_limit:
                             final_prompt += "\n【減点指示】生徒の答案は語数制限を満たしていません（または過不足があります）。その旨を指摘し、減点してください。"
-                        
                         if rules['strict_space']:
                             final_prompt += "\n【フォーマット指示】記述スペースが狭いため、コメントは簡潔・短めにしてください。"
                         if rules['custom']:
@@ -551,7 +563,7 @@ def main():
                     text_res, model_used = call_ai_hybrid(
                         prompt_text=final_prompt,
                         text_input=edited_text,
-                        images=current_ref_images,
+                        images=current_ref_images_view,
                         gemini_key=gemini_key,
                         openai_key=openai_key,
                         text_label="生徒の答案（採点対象）"
