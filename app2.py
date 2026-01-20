@@ -8,6 +8,11 @@ import io
 import openai
 import base64
 import json
+import zipfile
+import os
+import re
+import shutil
+from pathlib import Path
 
 # ==========================================
 # ★設定エリア
@@ -18,6 +23,9 @@ OPENAI_MODEL_NAME = "gpt-4o-mini"
 USD_JPY_RATE = 155.0
 COST_INPUT_PER_1M = 0.15
 COST_OUTPUT_PER_1M = 0.60
+
+# あなたのデフォルト保存先フォルダ
+DEFAULT_BASE_DIR = r"C:\Users\seory\OneDrive\添削用フォルダ"
 
 # ==========================================
 # 初期化・セッション管理
@@ -88,7 +96,7 @@ DEFAULT_SYSTEM_PROMPT = """
 """
 
 # ==========================================
-# 関数群
+# 関数群: 共通
 # ==========================================
 def process_uploaded_file(uploaded_file):
     images = []
@@ -181,11 +189,152 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         return f"OpenAI失敗: {e}", "Error"
 
 # ==========================================
+# 関数群: 答案仕分け (Auto Sorter)
+# ==========================================
+def parse_ice_table(text):
+    """
+    ICEのコピーテキストから {生徒コード: テスト名} の辞書を作成
+    """
+    mapping = {}
+    lines = text.strip().split('\n')
+    for line in lines:
+        # タブまたは連続する空白で分割
+        parts = re.split(r'\t|\s{2,}', line.strip())
+        
+        # 必要なカラムが含まれているか簡易チェック (日付、テスト名、コードなど最低要素数)
+        # 例: 2026/01/20 ... 東大型演習... ... 62150952
+        if len(parts) < 4:
+            continue
+            
+        student_code = None
+        test_name = None
+        
+        # 生徒コード(8桁の数字)を探す
+        for part in parts:
+            if re.fullmatch(r'\d{8}', part):
+                student_code = part
+                break
+        
+        # テスト名を探す (日本語を含み、かつコードではない長い文字列)
+        # ヒューリスティック: "年度" や "英語" が含まれる項目を優先
+        for part in parts:
+            if ("年度" in part or "英語" in part) and len(part) > 5:
+                test_name = part
+                break
+        
+        if student_code and test_name:
+            mapping[student_code] = test_name
+            
+    return mapping
+
+def backup_existing_file(target_path):
+    """
+    ファイルが存在する場合、_pre, _pre2... にリネームして退避させる
+    """
+    if not target_path.exists():
+        return
+    
+    # バックアップ名の決定
+    counter = 1
+    while True:
+        suffix = "_pre" if counter == 1 else f"_pre{counter}"
+        backup_name = f"{target_path.stem}{suffix}{target_path.suffix}"
+        backup_path = target_path.parent / backup_name
+        
+        if not backup_path.exists():
+            # 現在のファイルをバックアップ名にリネーム
+            try:
+                target_path.rename(backup_path)
+                return backup_name # ログ用
+            except OSError:
+                return None
+        counter += 1
+
+def sort_files(zip_file, text_data, base_dir_str):
+    """
+    ZIPを展開し、テキストデータの指示に従ってフォルダ分けする
+    """
+    logs = []
+    base_dir = Path(base_dir_str)
+    
+    if not base_dir.exists():
+        return ["❌ エラー: 指定された保存先フォルダが存在しません。パスを確認してください。"]
+
+    # 1. マッピング作成
+    mapping = parse_ice_table(text_data)
+    if not mapping:
+        return ["❌ エラー: ICEのテキストデータから情報を読み取れませんでした。コピー範囲を確認してください。"]
+    
+    logs.append(f"📋 {len(mapping)}件の答案情報を読み取りました。")
+
+    # 2. ZIP処理
+    try:
+        with zipfile.ZipFile(zip_file) as z:
+            for filename in z.namelist():
+                if not filename.endswith('.pdf'):
+                    continue
+                
+                # ファイル名から生徒コード抽出 (末尾の数字8桁)
+                # 例: 039111299162150952.pdf -> 62150952
+                match = re.search(r'(\d{8})\.pdf$', filename)
+                if not match:
+                    logs.append(f"⚠️ スキップ (コード不明): {filename}")
+                    continue
+                
+                student_code = match.group(1)
+                
+                if student_code not in mapping:
+                    logs.append(f"⚠️ スキップ (一覧に無し): {student_code} ({filename})")
+                    continue
+                
+                test_name = mapping[student_code]
+                
+                # 3. フォルダ構造決定
+                # 親フォルダ: "東大型演習 2020年度" など ("英語"の前まで、もしくは空白区切りの前半)
+                # ルール: "英語"があればその前まで。なければそのまま。
+                parent_match = re.search(r'^(.*?)(\s+英語|$)', test_name)
+                if parent_match:
+                    parent_name = parent_match.group(1).strip()
+                else:
+                    parent_name = test_name # フォールバック
+
+                # フルパス: Base / Parent / TestName / StudentCode.pdf
+                target_folder = base_dir / parent_name / test_name
+                
+                # フォルダ作成
+                try:
+                    target_folder.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    logs.append(f"❌ フォルダ作成エラー: {e}")
+                    continue
+                
+                target_path = target_folder / f"{student_code}.pdf"
+                
+                # 4. 重複回避 (_pre処理)
+                renamed_backup = None
+                if target_path.exists():
+                    renamed_backup = backup_existing_file(target_path)
+                
+                # 5. 保存
+                with z.open(filename) as source, open(target_path, "wb") as dest:
+                    shutil.copyfileobj(source, dest)
+                
+                msg = f"✅ 配置: {student_code} -> {parent_name}/{test_name}"
+                if renamed_backup:
+                    msg += f" (旧ファイルを {renamed_backup} に退避)"
+                logs.append(msg)
+
+    except Exception as e:
+        return [f"❌ ZIP処理エラー: {e}"]
+        
+    return logs
+
+# ==========================================
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv20", page_icon="💬", layout="wide")
-    st.title("💬 添削くん v20 (基準プレビュー・追加質問)")
+    st.set_page_config(page_title="添削くんv21", page_icon="🗂️", layout="wide")
+    st.title("🗂️ 添削くん v21 (答案自動仕分け機能)")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -206,7 +355,7 @@ def main():
         
         st.divider()
         st.header("📥 データ管理")
-        st.warning("【注意】ブラウザを閉じると登録データは消えます。必ず「設定ファイルを保存」してください。", icon="⚠️")
+        st.warning("【注意】ブラウザを閉じると登録データは消えます。", icon="⚠️")
         
         if not st.session_state.question_registry:
             json_str = "{}"
@@ -239,7 +388,45 @@ def main():
         st.warning("APIキーを入力してください。")
         return
 
-    tab_mark, tab_reg, tab_hist = st.tabs(["📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
+    # ★タブ構成変更: 仕分けタブを追加
+    tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
+
+    # ==========================================
+    # タブ0: 答案仕分け (Auto Sorter)
+    # ==========================================
+    with tab_sort:
+        st.subheader("🧹 ICE答案の自動仕分け・保存")
+        st.info("ICEからダウンロードしたZIPと表を貼り付けるだけで、あなたのPCのフォルダに自動で振り分けます。")
+        
+        # 保存先設定
+        base_dir_input = st.text_input("保存先の親フォルダ (あなたのPC上のパス)", value=DEFAULT_BASE_DIR)
+        
+        col_sort1, col_sort2 = st.columns(2)
+        
+        with col_sort1:
+            st.markdown("**1. ICEの表をコピペ** (Ctrl+A -> Ctrl+C -> Ctrl+V)")
+            ice_text = st.text_area("ICEの画面全体のテキスト", height=200, placeholder="状態\tCT受付日\tAS_ID...\n2026/01/20...")
+            
+        with col_sort2:
+            st.markdown("**2. ZIPファイルをアップロード**")
+            ice_zip = st.file_uploader("ICEからDLしたzipファイル", type=["zip"])
+            
+        if st.button("🚀 仕分けを実行する", type="primary"):
+            if not ice_text or not ice_zip or not base_dir_input:
+                st.error("必要な情報が足りません。テキスト、ZIP、フォルダパスを確認してください。")
+            else:
+                with st.spinner("ファイルを解析して移動中..."):
+                    logs = sort_files(ice_zip, ice_text, base_dir_input)
+                    
+                    st.success("処理が完了しました！")
+                    with st.expander("処理ログを表示", expanded=True):
+                        for log in logs:
+                            if "❌" in log:
+                                st.error(log)
+                            elif "⚠️" in log:
+                                st.warning(log)
+                            else:
+                                st.write(log)
 
     # ==========================================
     # タブ2: 基準データ登録
@@ -343,67 +530,42 @@ def main():
     # タブ1: 採点作業エリア
     # ==========================================
     with tab_mark:
-        # --- 現在の基準資料を特定 ---
+        # 基準資料キャッシュの特定
         current_ref_images_view = []
         if st.session_state.registry_ref_img_cache:
             current_ref_images_view = st.session_state.registry_ref_img_cache
         else:
             current_ref_images_view = st.session_state.ref_img_cache
 
-        # ------------------------------------
-        # Phase 3: 結果表示モード (追加質問機能)
-        # ------------------------------------
+        # Phase 3: 結果表示
         if st.session_state.latest_result:
             st.success("🎉 添削完了")
             st.markdown("---")
             st.markdown(st.session_state.latest_result)
             
-            # ★追加: 追加質問エリア
+            # 追加質問
             st.markdown("---")
             st.subheader("💬 AIへの追加指示・質問")
-            st.caption("今の添削結果について、疑問点を聞いたり修正指示を出せます。")
-            
             with st.form("followup_form"):
-                user_q = st.text_area("質問や指示を入力", placeholder="例: 問2の減点理由を詳しく教えて / 問1のスペルミスは見逃して再採点して")
+                user_q = st.text_area("質問や指示を入力", placeholder="例: 問2の減点理由を詳しく / 問1のスペルミスは見逃して再採点して")
                 submitted = st.form_submit_button("送信")
-                
                 if submitted and user_q:
                     with st.spinner("AIと思考中..."):
-                        # 文脈を作る
                         context_prompt = f"""
-                        あなたは英語教師です。先ほど以下の生徒の答案を添削しました。
-                        
-                        【これまでの添削結果】
-                        {st.session_state.latest_result}
-                        
-                        【ユーザーからの追加指示・質問】
-                        {user_q}
-                        
-                        上記の指示に従って、回答してください（修正が必要な場合は修正版の答案を出力し、質問への回答なら解説してください）。
+                        あなたは英語教師です。以下の添削結果について、追加の指示に従ってください。
+                        【これまでの添削結果】{st.session_state.latest_result}
+                        【追加指示】{user_q}
                         """
-                        
-                        # 画像（基準と生徒）も念のため送る（参照できるように）
-                        all_ref_imgs = current_ref_images_view
-                        # 生徒画像はキャッシュから
-                        all_student_imgs = st.session_state.student_img_cache
-                        
-                        imgs_to_send = all_ref_imgs # 基準を優先
-                        
                         text_res, model_used = call_ai_hybrid(
-                            prompt_text=context_prompt,
-                            text_input="",
-                            images=imgs_to_send,
-                            gemini_key=gemini_key,
-                            openai_key=openai_key,
-                            text_label="以前の履歴"
+                            prompt_text=context_prompt, text_input="", 
+                            images=current_ref_images_view + st.session_state.student_img_cache, # 両方参照させる
+                            gemini_key=gemini_key, openai_key=openai_key, text_label="履歴"
                         )
-                        
-                        # 結果に追記
                         new_block = f"\n\n---\n### 💬 追加指示: {user_q}\n\n### 🤖 AI ({model_used})\n{text_res}"
                         st.session_state.latest_result += new_block
                         st.rerun()
             
-            # ★追加: 基準資料プレビュー (アコーディオン)
+            # 基準プレビュー
             if current_ref_images_view:
                 with st.expander("📚 基準資料・配点基準を確認する", expanded=False):
                     for i, img in enumerate(current_ref_images_view):
@@ -431,9 +593,7 @@ def main():
                 st.session_state.active_memos = ""
                 st.rerun()
 
-        # ------------------------------------
         # Phase 1: 入力モード
-        # ------------------------------------
         elif not st.session_state.draft_text:
             st.subheader("1. 基準データを選択")
             input_mode = st.radio("入力方法", ["登録データから呼び出す", "手動でアップロード"], horizontal=True)
@@ -504,9 +664,7 @@ def main():
                         st.session_state.draft_text = text_res
                         st.rerun()
 
-        # ------------------------------------
         # Phase 2: 確認・修正画面
-        # ------------------------------------
         else:
             st.info("✅ 読み取り完了。確認してください。")
             current_student_images = st.session_state.student_img_cache
@@ -527,7 +685,6 @@ def main():
                     st.rerun()
 
             with img_col:
-                # ★変更: タブで基準資料も見れるようにする
                 tab_s_view, tab_r_view = st.tabs(["🔍 生徒の答案", "📚 基準・配点資料"])
                 with tab_s_view:
                     for i, img in enumerate(current_student_images):
