@@ -12,6 +12,7 @@ import zipfile
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from collections import defaultdict
 
@@ -25,7 +26,7 @@ USD_JPY_RATE = 155.0
 COST_INPUT_PER_1M = 0.15
 COST_OUTPUT_PER_1M = 0.60
 
-# デフォルト保存先
+# デフォルト保存先 (ローカル実行用)
 DEFAULT_BASE_DIR = r"C:\Users\seory\OneDrive\添削用フォルダ"
 
 # ==========================================
@@ -185,13 +186,9 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         return f"OpenAI失敗: {e}", "Error"
 
 # ==========================================
-# 関数群: 答案仕分け (Auto Sorter v26: 7-8桁対応)
+# 関数群: 答案仕分け (Auto Sorter v27: Hybrid Mode)
 # ==========================================
 def parse_ice_table_robust(text):
-    """
-    ICEのコピーテキストから {生徒コード: [テスト名...]} を作成
-    ★変更: 生徒コードを7桁または8桁に対応
-    """
     mapping = defaultdict(list)
     lines = text.strip().split('\n')
     
@@ -207,46 +204,30 @@ def parse_ice_table_robust(text):
         line = line.strip()
         if not line: continue
 
-        # 1. 生徒コード(7または8桁)を探す
-        # 日付(2026...)やID(110...)と区別するため、前後に数字がないものを探す
-        # AS_ID(9桁)は除外される
         code_matches = list(re.finditer(r'(?<!\d)(\d{7,8})(?!\d)', line))
-        
-        if not code_matches:
-            continue
-            
-        # 複数ある場合、通常は行の最後尾が生徒コード
-        # 例: ...未対応 6193803 NaN
+        if not code_matches: continue
         student_code = code_matches[-1].group(1) 
         
-        # 2. テスト名抽出（引き算ロジック）
         parts = re.split(r'\t|\s{2,}| ', line)
         candidate_parts = []
-        
         for part in parts:
             part = part.strip()
             if not part: continue
             if part == student_code: continue
-            
             is_ignore = False
             for pat in ignore_patterns:
                 if re.fullmatch(pat, part):
                     is_ignore = True
                     break
-            if re.fullmatch(r'\d{9,}', part): # 9桁以上のIDを除外
-                is_ignore = True
-                
-            if not is_ignore:
-                candidate_parts.append(part)
+            if re.fullmatch(r'\d{9,}', part): is_ignore = True
+            if not is_ignore: candidate_parts.append(part)
         
         if candidate_parts:
             final_parts = [p for p in candidate_parts if len(p) > 1 or re.match(r'[A-Za-z0-9]', p)]
             test_name = " ".join(final_parts)
-            
             if len(test_name) > 3:
                 if test_name not in mapping[student_code]:
                     mapping[student_code].append(test_name)
-
     return mapping
 
 def normalize_folder_name(test_name):
@@ -269,24 +250,18 @@ def backup_existing_file(target_path):
                 return None
         counter += 1
 
-def save_file_logic(file_bytes, filename, mapping, base_dir, logs):
+def save_to_temp_structure(file_bytes, filename, mapping, root_path, logs):
     """
-    ファイル保存ロジック (逆引きマッチング版)
+    一時ディレクトリ内にフォルダ構造を作って保存するロジック
     """
-    # ★変更: ファイル名からコードを抽出するのではなく、
-    # マッピングにあるコードがファイル名に含まれているかを確認する
-    
     target_code = None
-    
     for code in mapping.keys():
-        # ファイル名がそのコードで終わっているかチェック (.pdfの前)
-        # 例: ...06193803.pdf ends with 6193803.pdf -> True
         if filename.endswith(f"{code}.pdf"):
             target_code = code
             break
     
     if not target_code:
-        logs.append(f"⚠️ スキップ (一覧にあるコードと一致しません): {filename}")
+        logs.append(f"⚠️ スキップ (コード不一致): {filename}")
         return
 
     tests = mapping[target_code]
@@ -295,115 +270,127 @@ def save_file_logic(file_bytes, filename, mapping, base_dir, logs):
     if len(tests) > 1:
         normalized_names = set([normalize_folder_name(t) for t in tests])
         if len(normalized_names) > 1:
-            manual_folder = base_dir / "_⚠️重複・手動仕分け" / target_code
+            manual_folder = root_path / "_⚠️重複・手動仕分け" / target_code
             manual_folder.mkdir(parents=True, exist_ok=True)
             target_path = manual_folder / f"{target_code}.pdf"
             
+            # Temp内でも重複はありえる（ZIP内に同名がある場合など）
             if target_path.exists(): backup_existing_file(target_path)
             
             with open(target_path, "wb") as dest:
                 dest.write(file_bytes)
-            logs.append(f"⚠️ 重複隔離: {target_code} (複数の異なる問題あり)")
+            logs.append(f"⚠️ 重複隔離: {target_code}")
             return
 
     # 通常処理
     raw_test_name = tests[0]
     folder_test_name = normalize_folder_name(raw_test_name)
-    
-    # 親フォルダ生成 (英語 の前まで)
     parent_match = re.search(r'^(.*?)(\s+英語|$)', folder_test_name)
     if parent_match:
         parent_name = parent_match.group(1).strip()
     else:
         parent_name = folder_test_name
 
-    target_folder = base_dir / parent_name / folder_test_name
-    
-    try:
-        target_folder.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logs.append(f"❌ フォルダ作成エラー: {e}")
-        return
+    target_folder = root_path / parent_name / folder_test_name
+    target_folder.mkdir(parents=True, exist_ok=True)
     
     target_path = target_folder / f"{target_code}.pdf"
     
-    renamed_backup = None
+    renamed = None
     if target_path.exists():
-        renamed_backup = backup_existing_file(target_path)
+        renamed = backup_existing_file(target_path)
     
     with open(target_path, "wb") as dest:
         dest.write(file_bytes)
     
-    msg = f"✅ 配置: {target_code} -> {parent_name}/{folder_test_name}"
-    if renamed_backup:
-        msg += f" (旧: {renamed_backup})"
+    msg = f"✅ 配置: {target_code} -> {folder_test_name}"
+    if renamed: msg += f" (旧: {renamed})"
     logs.append(msg)
 
+def create_zip_from_dir(dir_path):
+    """ディレクトリをZIP化してBytesIOで返す"""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(dir_path):
+            for file in files:
+                abs_path = os.path.join(root, file)
+                rel_path = os.path.relpath(abs_path, dir_path)
+                zf.write(abs_path, rel_path)
+    zip_buffer.seek(0)
+    return zip_buffer
 
-def sort_files_zip(zip_file, text_data, base_dir_str):
+def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
     logs = []
-    path_str = base_dir_str.strip().strip('"').strip("'")
-    if path_str.lower() == "desktop":
-        base_dir = Path(os.path.expanduser("~/Desktop")) / "Answers"
-    else:
-        base_dir = Path(os.path.abspath(path_str))
     
-    try:
-        base_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        return [f"❌ エラー: 保存先フォルダ異常: {e}"], base_dir
-
+    # マッピング
     mapping = parse_ice_table_robust(text_data)
     if not mapping:
-        return ["❌ エラー: テスト名と生徒コードを読み取れませんでした。"], base_dir
-    
-    logs.append(f"📋 {len(mapping)}件の生徒情報を認識")
-
-    try:
-        with zipfile.ZipFile(zip_file) as z:
-            for filename in z.namelist():
-                if not filename.endswith('.pdf'): continue
-                with z.open(filename) as source:
-                    file_bytes = source.read()
-                    save_file_logic(file_bytes, filename, mapping, base_dir, logs)
-    except Exception as e:
-        return [f"❌ ZIP処理エラー: {e}"], base_dir
-        
-    return logs, base_dir
-
-def sort_single_file(pdf_file, text_data, base_dir_str):
-    logs = []
-    path_str = base_dir_str.strip().strip('"').strip("'")
-    if path_str.lower() == "desktop":
-        base_dir = Path(os.path.expanduser("~/Desktop")) / "Answers"
-    else:
-        base_dir = Path(os.path.abspath(path_str))
-    
-    try:
-        base_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        return [f"❌ エラー: 保存先フォルダ異常: {e}"], base_dir
-
-    mapping = parse_ice_table_robust(text_data)
-    if not mapping:
-        return ["❌ エラー: テキストから情報を読み取れませんでした。"], base_dir
+        return ["❌ ICEテキスト解析失敗"], None, None
     
     logs.append(f"📋 {len(mapping)}件の情報を認識")
 
-    try:
-        file_bytes = pdf_file.read()
-        save_file_logic(file_bytes, pdf_file.name, mapping, base_dir, logs)
-    except Exception as e:
-        return [f"❌ PDF処理エラー: {e}"], base_dir
+    # 1. 一時ディレクトリで作業（クラウド/ローカル共通）
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
         
-    return logs, base_dir
+        # ファイル展開・配置
+        try:
+            if zip_file_obj:
+                with zipfile.ZipFile(zip_file_obj) as z:
+                    for filename in z.namelist():
+                        if not filename.endswith('.pdf'): continue
+                        with z.open(filename) as source:
+                            save_to_temp_structure(source.read(), filename, mapping, temp_path, logs)
+            elif pdf_file_obj:
+                save_to_temp_structure(pdf_file_obj.read(), pdf_file_obj.name, mapping, temp_path, logs)
+        except Exception as e:
+            return [f"❌ ファイル処理エラー: {e}"], None, None
+
+        # 2. ZIP作成（ダウンロード用）
+        zip_output = create_zip_from_dir(temp_path)
+
+        # 3. ローカル保存（Windowsかつ書き込み可能な場合のみ）
+        local_saved_path = None
+        if os.name == 'nt' and local_base_path: # Windows check
+            try:
+                # パス調整
+                local_path_str = local_base_path.strip().strip('"').strip("'")
+                if local_path_str.lower() == "desktop":
+                    dest_root = Path(os.path.expanduser("~/Desktop")) / "Answers"
+                else:
+                    dest_root = Path(os.path.abspath(local_path_str))
+                
+                dest_root.mkdir(parents=True, exist_ok=True)
+                
+                # Tempから実ディレクトリへコピー (shutil.copytreeはフォルダがあるとエラーになるので工夫が必要)
+                # 今回は単純に walk して copy
+                for root, dirs, files in os.walk(temp_path):
+                    for file in files:
+                        src_file = Path(root) / file
+                        rel_path = src_file.relative_to(temp_path)
+                        dest_file = dest_root / rel_path
+                        
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # ローカルでもバックアップ処理
+                        if dest_file.exists():
+                            backup_existing_file(dest_file)
+                        
+                        shutil.copy2(src_file, dest_file)
+                
+                local_saved_path = str(dest_root)
+                logs.append(f"💾 ローカル保存完了: {local_saved_path}")
+            except Exception as e:
+                logs.append(f"⚠️ ローカル保存スキップ (権限なし/クラウド環境): {e}")
+
+        return logs, zip_output, local_saved_path
 
 # ==========================================
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv26", page_icon="🗂️", layout="wide")
-    st.title("🗂️ 添削くん v26 (7桁コード対応版)")
+    st.set_page_config(page_title="添削くんv27", page_icon="🗂️", layout="wide")
+    st.title("🗂️ 添削くん v27 (ハイブリッド仕分け)")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -460,55 +447,61 @@ def main():
     tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
     # ==========================================
-    # タブ0: 答案仕分け (v26)
+    # タブ0: 答案仕分け (v27)
     # ==========================================
     with tab_sort:
-        st.subheader("🧹 ICE答案の自動仕分け・保存")
-        st.info("ICEからダウンロードしたZIPと表を貼り付けるだけで、あなたのPCのフォルダに自動で振り分けます。")
+        st.subheader("🧹 ICE答案の自動仕分け")
+        st.caption("ローカル環境なら指定フォルダへ保存、Web環境ならZIPダウンロードが可能です。")
         
-        base_dir_input = st.text_input("保存先の親フォルダ (「Desktop」でデスクトップに作成)", value=DEFAULT_BASE_DIR)
+        base_dir_input = st.text_input("保存先の親フォルダ (ローカル実行時のみ有効)", value=DEFAULT_BASE_DIR)
         
         st.markdown("---")
-        
         sort_mode = st.radio("モード選択", ["一括 (ZIPファイル)", "個別 (PDF単体)"], horizontal=True)
         
         col_sort1, col_sort2 = st.columns(2)
-        
         with col_sort1:
-            if sort_mode == "一括 (ZIPファイル)":
-                st.markdown("**1. ICEの表をコピペ (全体)**")
-            else:
-                st.markdown("**1. ICEの行をコピペ (その生徒の行だけ)**")
-                
-            ice_text = st.text_area("テキスト貼り付け", height=150, placeholder="状態\tCT受付日...\n2026/01/20...")
-            
+            st.markdown("**1. ICEの表をコピペ**")
+            ice_text = st.text_area("ICEテキスト", height=150, placeholder="状態\tCT受付日...")
         with col_sort2:
+            st.markdown("**2. ファイルアップロード**")
             if sort_mode == "一括 (ZIPファイル)":
-                st.markdown("**2. ZIPをアップロード**")
-                ice_zip = st.file_uploader("ICEのzipファイル", type=["zip"])
+                upload_file = st.file_uploader("ICEのzipファイル", type=["zip"])
             else:
-                st.markdown("**2. PDFをアップロード**")
-                ice_pdf = st.file_uploader("生徒のPDFファイル", type=["pdf"])
+                upload_file = st.file_uploader("生徒のPDFファイル", type=["pdf"])
             
         if st.button("🚀 仕分けを実行する", type="primary"):
-            if not ice_text or not base_dir_input:
-                st.error("保存先パスとテキスト情報は必須です。")
-            elif sort_mode == "一括 (ZIPファイル)" and not ice_zip:
-                st.error("ZIPファイルをアップロードしてください。")
-            elif sort_mode == "個別 (PDF単体)" and not ice_pdf:
-                st.error("PDFファイルをアップロードしてください。")
+            if not ice_text or not upload_file:
+                st.error("テキストとファイルの両方が必要です。")
             else:
-                with st.spinner("解析中..."):
-                    if sort_mode == "一括 (ZIPファイル)":
-                        result = sort_files_zip(ice_zip, ice_text, base_dir_input)
-                    else:
-                        result = sort_single_file(ice_pdf, ice_text, base_dir_input)
+                with st.spinner("解析・仕分け中..."):
+                    # 処理実行
+                    zip_obj = upload_file if sort_mode == "一括 (ZIPファイル)" else None
+                    pdf_obj = upload_file if sort_mode == "個別 (PDF単体)" else None
                     
-                    if isinstance(result, list) and len(result) > 0 and "❌" in result[0]:
-                         st.error(result[0])
+                    logs, zip_result, local_path = sort_process_hybrid(zip_obj, pdf_obj, ice_text, base_dir_input)
+                    
+                    # 結果表示
+                    if logs and "❌" in logs[0]:
+                        st.error(logs[0])
                     else:
-                        logs, actual_path = result
-                        st.success(f"完了！ 保存先: `{actual_path}`")
+                        st.success("処理完了！")
+                        
+                        # ダウンロードボタン (全員用)
+                        if zip_result:
+                            st.download_button(
+                                label="📦 仕分け結果をダウンロード (ZIP)",
+                                data=zip_result,
+                                file_name="Sorted_Answers.zip",
+                                mime="application/zip",
+                                type="primary"
+                            )
+                            if not local_path:
+                                st.info("ℹ️ Cloud環境のため、直接保存はできません。上のボタンからZIPをダウンロードしてください。")
+
+                        # ローカル保存結果 (ローカル用)
+                        if local_path:
+                            st.success(f"📂 PC内のフォルダにも保存しました: `{local_path}`")
+
                         with st.expander("詳細ログ", expanded=True):
                             for log in logs:
                                 if "❌" in log: st.error(log)
