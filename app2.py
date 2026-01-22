@@ -198,25 +198,19 @@ def parse_ice_table(text):
     mapping = {}
     lines = text.strip().split('\n')
     for line in lines:
-        # タブまたは連続する空白で分割
         parts = re.split(r'\t|\s{2,}', line.strip())
-        
-        # 必要なカラムが含まれているか簡易チェック (日付、テスト名、コードなど最低要素数)
-        # 例: 2026/01/20 ... 東大型演習... ... 62150952
         if len(parts) < 4:
             continue
             
         student_code = None
         test_name = None
         
-        # 生徒コード(8桁の数字)を探す
         for part in parts:
             if re.fullmatch(r'\d{8}', part):
                 student_code = part
                 break
         
-        # テスト名を探す (日本語を含み、かつコードではない長い文字列)
-        # ヒューリスティック: "年度" や "英語" が含まれる項目を優先
+        # "年度" または "英語" を含む長い文字列をテスト名とみなす
         for part in parts:
             if ("年度" in part or "英語" in part) and len(part) > 5:
                 test_name = part
@@ -228,54 +222,48 @@ def parse_ice_table(text):
     return mapping
 
 def backup_existing_file(target_path):
-    """
-    ファイルが存在する場合、_pre, _pre2... にリネームして退避させる
-    """
     if not target_path.exists():
         return
-    
-    # バックアップ名の決定
     counter = 1
     while True:
         suffix = "_pre" if counter == 1 else f"_pre{counter}"
         backup_name = f"{target_path.stem}{suffix}{target_path.suffix}"
         backup_path = target_path.parent / backup_name
-        
         if not backup_path.exists():
-            # 現在のファイルをバックアップ名にリネーム
             try:
                 target_path.rename(backup_path)
-                return backup_name # ログ用
+                return backup_name
             except OSError:
                 return None
         counter += 1
 
 def sort_files(zip_file, text_data, base_dir_str):
-    """
-    ZIPを展開し、テキストデータの指示に従ってフォルダ分けする
-    """
     logs = []
+    
+    # ★改良: パス文字列の前後の引用符を削除 (コピペミス対策)
+    base_dir_str = base_dir_str.strip().strip('"').strip("'")
     base_dir = Path(base_dir_str)
     
+    # ★改良: フォルダが存在しない場合、作成を試みる
     if not base_dir.exists():
-        return ["❌ エラー: 指定された保存先フォルダが存在しません。パスを確認してください。"]
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+            logs.append(f"📂 保存先フォルダが存在しなかったため、新規作成しました: {base_dir}")
+        except Exception as e:
+            return [f"❌ エラー: 保存先フォルダを作成できませんでした。パスが正しいか確認してください。\n詳細: {e}"]
 
-    # 1. マッピング作成
     mapping = parse_ice_table(text_data)
     if not mapping:
         return ["❌ エラー: ICEのテキストデータから情報を読み取れませんでした。コピー範囲を確認してください。"]
     
-    logs.append(f"📋 {len(mapping)}件の答案情報を読み取りました。")
+    logs.append(f"📋 {len(mapping)}件の答案情報を認識")
 
-    # 2. ZIP処理
     try:
         with zipfile.ZipFile(zip_file) as z:
             for filename in z.namelist():
                 if not filename.endswith('.pdf'):
                     continue
                 
-                # ファイル名から生徒コード抽出 (末尾の数字8桁)
-                # 例: 039111299162150952.pdf -> 62150952
                 match = re.search(r'(\d{8})\.pdf$', filename)
                 if not match:
                     logs.append(f"⚠️ スキップ (コード不明): {filename}")
@@ -284,24 +272,22 @@ def sort_files(zip_file, text_data, base_dir_str):
                 student_code = match.group(1)
                 
                 if student_code not in mapping:
-                    logs.append(f"⚠️ スキップ (一覧に無し): {student_code} ({filename})")
+                    logs.append(f"⚠️ スキップ (一覧に無し): {student_code}")
                     continue
                 
                 test_name = mapping[student_code]
                 
-                # 3. フォルダ構造決定
-                # 親フォルダ: "東大型演習 2020年度" など ("英語"の前まで、もしくは空白区切りの前半)
-                # ルール: "英語"があればその前まで。なければそのまま。
+                # ★フォルダ名生成ロジック
+                # 「早稲田大学法学部 2024年度 英語 第6問 第1回」 -> 親: "早稲田大学法学部 2024年度"
+                # ルール: "英語" の前までを親とする。なければ全部。
                 parent_match = re.search(r'^(.*?)(\s+英語|$)', test_name)
                 if parent_match:
                     parent_name = parent_match.group(1).strip()
                 else:
-                    parent_name = test_name # フォールバック
+                    parent_name = test_name
 
-                # フルパス: Base / Parent / TestName / StudentCode.pdf
                 target_folder = base_dir / parent_name / test_name
                 
-                # フォルダ作成
                 try:
                     target_folder.mkdir(parents=True, exist_ok=True)
                 except Exception as e:
@@ -310,18 +296,16 @@ def sort_files(zip_file, text_data, base_dir_str):
                 
                 target_path = target_folder / f"{student_code}.pdf"
                 
-                # 4. 重複回避 (_pre処理)
                 renamed_backup = None
                 if target_path.exists():
                     renamed_backup = backup_existing_file(target_path)
                 
-                # 5. 保存
                 with z.open(filename) as source, open(target_path, "wb") as dest:
                     shutil.copyfileobj(source, dest)
                 
-                msg = f"✅ 配置: {student_code} -> {parent_name}/{test_name}"
+                msg = f"✅ {student_code} -> {parent_name}/..."
                 if renamed_backup:
-                    msg += f" (旧ファイルを {renamed_backup} に退避)"
+                    msg += f" (旧: {renamed_backup})"
                 logs.append(msg)
 
     except Exception as e:
@@ -333,8 +317,8 @@ def sort_files(zip_file, text_data, base_dir_str):
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv21", page_icon="🗂️", layout="wide")
-    st.title("🗂️ 添削くん v21 (答案自動仕分け機能)")
+    st.set_page_config(page_title="添削くんv22", page_icon="🗂️", layout="wide")
+    st.title("🗂️ 添削くん v22 (仕分けエラー修正版)")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -388,11 +372,10 @@ def main():
         st.warning("APIキーを入力してください。")
         return
 
-    # ★タブ構成変更: 仕分けタブを追加
     tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
     # ==========================================
-    # タブ0: 答案仕分け (Auto Sorter)
+    # タブ0: 答案仕分け (修正版)
     # ==========================================
     with tab_sort:
         st.subheader("🧹 ICE答案の自動仕分け・保存")
@@ -530,7 +513,7 @@ def main():
     # タブ1: 採点作業エリア
     # ==========================================
     with tab_mark:
-        # 基準資料キャッシュの特定
+        # 基準資料キャッシュ
         current_ref_images_view = []
         if st.session_state.registry_ref_img_cache:
             current_ref_images_view = st.session_state.registry_ref_img_cache
@@ -558,7 +541,7 @@ def main():
                         """
                         text_res, model_used = call_ai_hybrid(
                             prompt_text=context_prompt, text_input="", 
-                            images=current_ref_images_view + st.session_state.student_img_cache, # 両方参照させる
+                            images=current_ref_images_view + st.session_state.student_img_cache, 
                             gemini_key=gemini_key, openai_key=openai_key, text_label="履歴"
                         )
                         new_block = f"\n\n---\n### 💬 追加指示: {user_q}\n\n### 🤖 AI ({model_used})\n{text_res}"
