@@ -25,7 +25,7 @@ USD_JPY_RATE = 155.0
 COST_INPUT_PER_1M = 0.15
 COST_OUTPUT_PER_1M = 0.60
 
-# デフォルト保存先 (自分の環境用)
+# デフォルト保存先
 DEFAULT_BASE_DIR = r"C:\Users\seory\OneDrive\添削用フォルダ"
 
 # ==========================================
@@ -126,7 +126,6 @@ def base64_to_pil(base64_str):
     return Image.open(io.BytesIO(base64.b64decode(base64_str)))
 
 def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text_label="テキスト情報"):
-    # 1. Gemini
     try:
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
@@ -151,7 +150,6 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         else:
             st.warning(f"⚠️ Geminiエラー({error_msg})。OpenAIへ切り替えます...")
 
-    # 2. OpenAI
     if not openai_key:
         return "エラー: OpenAI APIキー未設定。", "Error"
 
@@ -187,86 +185,72 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         return f"OpenAI失敗: {e}", "Error"
 
 # ==========================================
-# 関数群: 答案仕分け (Auto Sorter v24)
+# 関数群: 答案仕分け (Auto Sorter v26: 7-8桁対応)
 # ==========================================
-def parse_ice_table(text):
+def parse_ice_table_robust(text):
     """
     ICEのコピーテキストから {生徒コード: [テスト名...]} を作成
-    ★改良: 正規表現を使って、より確実にテスト名とコードを抽出する
+    ★変更: 生徒コードを7桁または8桁に対応
     """
     mapping = defaultdict(list)
     lines = text.strip().split('\n')
     
-    # パターン: 
-    # (任意の試験種別) (テスト名) (未対応/対応/完了) (8桁コード)
-    # 例: 単元ジャンル別演習 東大型演習 2014年度 英語3 第2問2 未対応 62150952
-    # 生徒コード(8桁)をアンカーにして、その手前の文字列を取得する戦略
+    ignore_patterns = [
+        r'\d{4}/\d{2}/\d{2}', 
+        r'未対応|対応|完了|添削中|NaN', 
+        r'単元ジャンル別演習|過去問演習講座|答案練習講座', 
+        r'^\d+$', 
+        r'^\d+/\d+$', 
+    ]
     
     for line in lines:
         line = line.strip()
         if not line: continue
 
-        # 1. まず8桁の生徒コードを探す
-        # (日付 2026/01/20 などと混同しないよう、前後に数字がない8桁を狙う)
-        code_matches = list(re.finditer(r'(?<!\d)(\d{8})(?!\d)', line))
+        # 1. 生徒コード(7または8桁)を探す
+        # 日付(2026...)やID(110...)と区別するため、前後に数字がないものを探す
+        # AS_ID(9桁)は除外される
+        code_matches = list(re.finditer(r'(?<!\d)(\d{7,8})(?!\d)', line))
         
         if not code_matches:
             continue
             
-        # 1行に複数の8桁数字がある場合（AS_ID: 110... は9桁なので除外されるはずだが念のため）
-        # 通常、行の最後の方にあるのが生徒コード。
-        student_code = code_matches[-1].group(1) # 一番後ろの8桁を採用
+        # 複数ある場合、通常は行の最後尾が生徒コード
+        # 例: ...未対応 6193803 NaN
+        student_code = code_matches[-1].group(1) 
         
-        # 2. テスト名を抽出
-        # 生徒コードより「前」にある文字列から、"未対応"などのステータスを除去して取得
-        # 行全体: ... [Type] [TestName] [Status] [Code] ...
+        # 2. テスト名抽出（引き算ロジック）
+        parts = re.split(r'\t|\s{2,}| ', line)
+        candidate_parts = []
         
-        # 行を分割して解析
-        parts = re.split(r'\t|\s{2,}| ', line) # スペース区切りも許容
-        
-        # キーワード（年度、英語）を含むパーツを探す
-        candidate_test_name = ""
-        
-        # 少し乱暴だが、「年度」か「英語」が含まれ、かつ数字だけのパーツではないものを結合して探す
-        # あるいは、"東大型" "京大型" などが含まれるか。
-        
-        # シンプルな戦略: 
-        # 生徒コードの直前にある「未対応」「対応」などをスキップし、その前の長い文字列を取得
-        
-        # 正規表現で一発抽出を試みる
-        # 「(試験種別) (テスト名...) (未対応など) (生徒コード)」
-        pattern = r'(?P<type>単元ジャンル別演習|過去問演習講座|.*演習.*?)\s+(?P<test>.+?)\s+(?:未対応|対応|対応済|完了|NaN)\s+(?P<code>\d{8})'
-        match = re.search(pattern, line)
-        
-        if match:
-            extracted_code = match.group('code')
-            extracted_test = match.group('test')
-            
-            # 生徒コードが一致しているか確認
-            if extracted_code == student_code:
-                if extracted_test not in mapping[student_code]:
-                    mapping[student_code].append(extracted_test.strip())
-                continue # 成功したら次へ
-
-        # 正規表現で取れなかった場合のフォールバック（以前のロジックの改良版）
-        # パーツから「年度」か「英語」を含むものを探す
         for part in parts:
-            if ("年度" in part or "英語" in part) and len(part) > 5:
-                # ゴミ除去（日付などがくっついている場合）
-                clean_part = part.strip()
-                if clean_part not in mapping[student_code]:
-                    mapping[student_code].append(clean_part)
-                break # 1つ見つけたらそれをテスト名とする
+            part = part.strip()
+            if not part: continue
+            if part == student_code: continue
+            
+            is_ignore = False
+            for pat in ignore_patterns:
+                if re.fullmatch(pat, part):
+                    is_ignore = True
+                    break
+            if re.fullmatch(r'\d{9,}', part): # 9桁以上のIDを除外
+                is_ignore = True
+                
+            if not is_ignore:
+                candidate_parts.append(part)
+        
+        if candidate_parts:
+            final_parts = [p for p in candidate_parts if len(p) > 1 or re.match(r'[A-Za-z0-9]', p)]
+            test_name = " ".join(final_parts)
+            
+            if len(test_name) > 3:
+                if test_name not in mapping[student_code]:
+                    mapping[student_code].append(test_name)
 
     return mapping
 
 def normalize_folder_name(test_name):
-    """
-    フォルダ名用にテスト名を正規化
-    「第3回」などの表記を削除して、同じ問題なら同じフォルダになるようにする
-    """
-    # "第X回" または "第X回目" を削除
-    clean_name = re.sub(r'\s+第\d+回目?', '', test_name)
+    clean_name = re.sub(r'[\s　]+第\d+回目?', '', test_name)
     return clean_name.strip()
 
 def backup_existing_file(target_path):
@@ -285,113 +269,132 @@ def backup_existing_file(target_path):
                 return None
         counter += 1
 
-def sort_files(zip_file, text_data, base_dir_str):
+def save_file_logic(file_bytes, filename, mapping, base_dir, logs):
+    """
+    ファイル保存ロジック (逆引きマッチング版)
+    """
+    # ★変更: ファイル名からコードを抽出するのではなく、
+    # マッピングにあるコードがファイル名に含まれているかを確認する
+    
+    target_code = None
+    
+    for code in mapping.keys():
+        # ファイル名がそのコードで終わっているかチェック (.pdfの前)
+        # 例: ...06193803.pdf ends with 6193803.pdf -> True
+        if filename.endswith(f"{code}.pdf"):
+            target_code = code
+            break
+    
+    if not target_code:
+        logs.append(f"⚠️ スキップ (一覧にあるコードと一致しません): {filename}")
+        return
+
+    tests = mapping[target_code]
+    
+    # 重複チェック
+    if len(tests) > 1:
+        normalized_names = set([normalize_folder_name(t) for t in tests])
+        if len(normalized_names) > 1:
+            manual_folder = base_dir / "_⚠️重複・手動仕分け" / target_code
+            manual_folder.mkdir(parents=True, exist_ok=True)
+            target_path = manual_folder / f"{target_code}.pdf"
+            
+            if target_path.exists(): backup_existing_file(target_path)
+            
+            with open(target_path, "wb") as dest:
+                dest.write(file_bytes)
+            logs.append(f"⚠️ 重複隔離: {target_code} (複数の異なる問題あり)")
+            return
+
+    # 通常処理
+    raw_test_name = tests[0]
+    folder_test_name = normalize_folder_name(raw_test_name)
+    
+    # 親フォルダ生成 (英語 の前まで)
+    parent_match = re.search(r'^(.*?)(\s+英語|$)', folder_test_name)
+    if parent_match:
+        parent_name = parent_match.group(1).strip()
+    else:
+        parent_name = folder_test_name
+
+    target_folder = base_dir / parent_name / folder_test_name
+    
+    try:
+        target_folder.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logs.append(f"❌ フォルダ作成エラー: {e}")
+        return
+    
+    target_path = target_folder / f"{target_code}.pdf"
+    
+    renamed_backup = None
+    if target_path.exists():
+        renamed_backup = backup_existing_file(target_path)
+    
+    with open(target_path, "wb") as dest:
+        dest.write(file_bytes)
+    
+    msg = f"✅ 配置: {target_code} -> {parent_name}/{folder_test_name}"
+    if renamed_backup:
+        msg += f" (旧: {renamed_backup})"
+    logs.append(msg)
+
+
+def sort_files_zip(zip_file, text_data, base_dir_str):
     logs = []
-    
-    # 1. パス解決 (Desktopショートカット対応)
     path_str = base_dir_str.strip().strip('"').strip("'")
-    
     if path_str.lower() == "desktop":
-        # ユーザーのデスクトップパスを自動取得
         base_dir = Path(os.path.expanduser("~/Desktop")) / "Answers"
-        logs.append(f"ℹ️ 'Desktop'が指定されたため、以下を作成/使用します: {base_dir}")
     else:
         base_dir = Path(os.path.abspath(path_str))
     
-    # フォルダ強制作成
     try:
         base_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        return [f"❌ エラー: 保存先フォルダを作成できませんでした。\nパス: {base_dir}\n詳細: {e}"]
+        return [f"❌ エラー: 保存先フォルダ異常: {e}"], base_dir
 
-    # 2. マッピング
-    mapping = parse_ice_table(text_data)
+    mapping = parse_ice_table_robust(text_data)
     if not mapping:
-        return ["❌ エラー: テスト名と生徒コードを読み取れませんでした。ICEの表全体をコピーしてください。"]
+        return ["❌ エラー: テスト名と生徒コードを読み取れませんでした。"], base_dir
     
     logs.append(f"📋 {len(mapping)}件の生徒情報を認識")
 
-    # 3. ZIP展開・移動
     try:
         with zipfile.ZipFile(zip_file) as z:
             for filename in z.namelist():
-                if not filename.endswith('.pdf'):
-                    continue
-                
-                # 生徒コード抽出
-                match = re.search(r'(\d{8})\.pdf$', filename)
-                if not match:
-                    logs.append(f"⚠️ ファイル名スキップ (コード不明): {filename}")
-                    continue
-                
-                student_code = match.group(1)
-                
-                if student_code not in mapping:
-                    logs.append(f"⚠️ マッピングスキップ (表に無し): {student_code}")
-                    continue
-                
-                tests = mapping[student_code]
-                
-                # 重複チェック (同コードで別名のテストがある場合)
-                if len(tests) > 1:
-                    # テスト名が違う -> 本当に別の問題かもしれないし、第3回などの表記揺れかもしれない
-                    # 正規化して比較する
-                    normalized_names = set([normalize_folder_name(t) for t in tests])
-                    
-                    if len(normalized_names) > 1:
-                        # 本当に違う問題が混ざっている -> 手動フォルダへ
-                        manual_folder = base_dir / "_⚠️重複・手動仕分け" / student_code
-                        manual_folder.mkdir(parents=True, exist_ok=True)
-                        target_path = manual_folder / f"{student_code}.pdf"
-                        
-                        if target_path.exists(): backup_existing_file(target_path)
-                        
-                        with z.open(filename) as source, open(target_path, "wb") as dest:
-                            shutil.copyfileobj(source, dest)
-                        logs.append(f"⚠️ 重複隔離: {student_code} (複数の異なる問題あり)")
-                        continue
-                    else:
-                        # 名前は違うが正規化したら同じ (例: "...第2問" と "...第2問 第3回") -> 同一とみなす
-                        pass 
-
-                # 処理対象のテスト名
-                raw_test_name = tests[0]
-                
-                # ★フォルダ名生成 (正規化: 第3回などを削除)
-                folder_test_name = normalize_folder_name(raw_test_name)
-                
-                # 親フォルダ ("英語"の前まで)
-                parent_match = re.search(r'^(.*?)(\s+英語|$)', folder_test_name)
-                if parent_match:
-                    parent_name = parent_match.group(1).strip()
-                else:
-                    parent_name = folder_test_name
-
-                # 保存先: Base / 親 / テスト名
-                target_folder = base_dir / parent_name / folder_test_name
-                
-                try:
-                    target_folder.mkdir(parents=True, exist_ok=True)
-                except Exception as e:
-                    logs.append(f"❌ フォルダ作成エラー: {e}")
-                    continue
-                
-                target_path = target_folder / f"{student_code}.pdf"
-                
-                # バックアップ処理
-                renamed = None
-                if target_path.exists():
-                    renamed = backup_existing_file(target_path)
-                
-                with z.open(filename) as source, open(target_path, "wb") as dest:
-                    shutil.copyfileobj(source, dest)
-                
-                msg = f"✅ 配置: {student_code} -> .../{folder_test_name}"
-                if renamed: msg += f" (旧: {renamed})"
-                logs.append(msg)
-
+                if not filename.endswith('.pdf'): continue
+                with z.open(filename) as source:
+                    file_bytes = source.read()
+                    save_file_logic(file_bytes, filename, mapping, base_dir, logs)
     except Exception as e:
-        return [f"❌ ZIP処理エラー: {e}"]
+        return [f"❌ ZIP処理エラー: {e}"], base_dir
+        
+    return logs, base_dir
+
+def sort_single_file(pdf_file, text_data, base_dir_str):
+    logs = []
+    path_str = base_dir_str.strip().strip('"').strip("'")
+    if path_str.lower() == "desktop":
+        base_dir = Path(os.path.expanduser("~/Desktop")) / "Answers"
+    else:
+        base_dir = Path(os.path.abspath(path_str))
+    
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return [f"❌ エラー: 保存先フォルダ異常: {e}"], base_dir
+
+    mapping = parse_ice_table_robust(text_data)
+    if not mapping:
+        return ["❌ エラー: テキストから情報を読み取れませんでした。"], base_dir
+    
+    logs.append(f"📋 {len(mapping)}件の情報を認識")
+
+    try:
+        file_bytes = pdf_file.read()
+        save_file_logic(file_bytes, pdf_file.name, mapping, base_dir, logs)
+    except Exception as e:
+        return [f"❌ PDF処理エラー: {e}"], base_dir
         
     return logs, base_dir
 
@@ -399,8 +402,8 @@ def sort_files(zip_file, text_data, base_dir_str):
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv24", page_icon="🗂️", layout="wide")
-    st.title("🗂️ 添削くん v24 (強力仕分け版)")
+    st.set_page_config(page_title="添削くんv26", page_icon="🗂️", layout="wide")
+    st.title("🗂️ 添削くん v26 (7桁コード対応版)")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -457,46 +460,60 @@ def main():
     tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
     # ==========================================
-    # タブ0: 答案仕分け (v24)
+    # タブ0: 答案仕分け (v26)
     # ==========================================
     with tab_sort:
         st.subheader("🧹 ICE答案の自動仕分け・保存")
         st.info("ICEからダウンロードしたZIPと表を貼り付けるだけで、あなたのPCのフォルダに自動で振り分けます。")
         
-        # 保存先設定
-        base_dir_input = st.text_input("保存先の親フォルダ (「Desktop」と入力するとデスクトップに作成)", value=DEFAULT_BASE_DIR)
+        base_dir_input = st.text_input("保存先の親フォルダ (「Desktop」でデスクトップに作成)", value=DEFAULT_BASE_DIR)
+        
+        st.markdown("---")
+        
+        sort_mode = st.radio("モード選択", ["一括 (ZIPファイル)", "個別 (PDF単体)"], horizontal=True)
         
         col_sort1, col_sort2 = st.columns(2)
         
         with col_sort1:
-            st.markdown("**1. ICEの表をコピペ**")
-            ice_text = st.text_area("ICEの画面全体のテキスト", height=200, placeholder="状態\tCT受付日\tAS_ID...\n2026/01/20...")
+            if sort_mode == "一括 (ZIPファイル)":
+                st.markdown("**1. ICEの表をコピペ (全体)**")
+            else:
+                st.markdown("**1. ICEの行をコピペ (その生徒の行だけ)**")
+                
+            ice_text = st.text_area("テキスト貼り付け", height=150, placeholder="状態\tCT受付日...\n2026/01/20...")
             
         with col_sort2:
-            st.markdown("**2. ZIPファイルをアップロード**")
-            ice_zip = st.file_uploader("ICEからDLしたzipファイル", type=["zip"])
+            if sort_mode == "一括 (ZIPファイル)":
+                st.markdown("**2. ZIPをアップロード**")
+                ice_zip = st.file_uploader("ICEのzipファイル", type=["zip"])
+            else:
+                st.markdown("**2. PDFをアップロード**")
+                ice_pdf = st.file_uploader("生徒のPDFファイル", type=["pdf"])
             
         if st.button("🚀 仕分けを実行する", type="primary"):
-            if not ice_text or not ice_zip or not base_dir_input:
-                st.error("必要な情報が足りません。")
+            if not ice_text or not base_dir_input:
+                st.error("保存先パスとテキスト情報は必須です。")
+            elif sort_mode == "一括 (ZIPファイル)" and not ice_zip:
+                st.error("ZIPファイルをアップロードしてください。")
+            elif sort_mode == "個別 (PDF単体)" and not ice_pdf:
+                st.error("PDFファイルをアップロードしてください。")
             else:
-                with st.spinner("ファイルを解析して移動中..."):
-                    result = sort_files(ice_zip, ice_text, base_dir_input)
+                with st.spinner("解析中..."):
+                    if sort_mode == "一括 (ZIPファイル)":
+                        result = sort_files_zip(ice_zip, ice_text, base_dir_input)
+                    else:
+                        result = sort_single_file(ice_pdf, ice_text, base_dir_input)
                     
                     if isinstance(result, list) and len(result) > 0 and "❌" in result[0]:
                          st.error(result[0])
                     else:
                         logs, actual_path = result
-                        st.success(f"処理完了！ 以下の場所に保存しました:\n\n`{actual_path}`")
-                        
-                        with st.expander("処理ログを表示", expanded=True):
+                        st.success(f"完了！ 保存先: `{actual_path}`")
+                        with st.expander("詳細ログ", expanded=True):
                             for log in logs:
-                                if "❌" in log:
-                                    st.error(log)
-                                elif "⚠️" in log:
-                                    st.warning(log)
-                                else:
-                                    st.write(log)
+                                if "❌" in log: st.error(log)
+                                elif "⚠️" in log: st.warning(log)
+                                else: st.write(log)
 
     # ==========================================
     # タブ2: 基準データ登録
