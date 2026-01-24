@@ -26,7 +26,7 @@ USD_JPY_RATE = 155.0
 COST_INPUT_PER_1M = 0.15
 COST_OUTPUT_PER_1M = 0.60
 
-# デフォルト保存先 (ローカル実行用)
+# デフォルト保存先
 DEFAULT_BASE_DIR = r"C:\Users\seory\OneDrive\添削用フォルダ"
 
 # ==========================================
@@ -186,28 +186,20 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         return f"OpenAI失敗: {e}", "Error"
 
 # ==========================================
-# 関数群: 答案仕分け (Auto Sorter v27: Hybrid Mode)
+# 関数群: 答案仕分け (Auto Sorter v27)
 # ==========================================
 def parse_ice_table_robust(text):
     mapping = defaultdict(list)
     lines = text.strip().split('\n')
-    
     ignore_patterns = [
-        r'\d{4}/\d{2}/\d{2}', 
-        r'未対応|対応|完了|添削中|NaN', 
-        r'単元ジャンル別演習|過去問演習講座|答案練習講座', 
-        r'^\d+$', 
-        r'^\d+/\d+$', 
+        r'\d{4}/\d{2}/\d{2}', r'未対応|対応|完了|添削中|NaN', r'単元ジャンル別演習|過去問演習講座|答案練習講座', r'^\d+$', r'^\d+/\d+$', 
     ]
-    
     for line in lines:
         line = line.strip()
         if not line: continue
-
         code_matches = list(re.finditer(r'(?<!\d)(\d{7,8})(?!\d)', line))
         if not code_matches: continue
         student_code = code_matches[-1].group(1) 
-        
         parts = re.split(r'\t|\s{2,}| ', line)
         candidate_parts = []
         for part in parts:
@@ -221,7 +213,6 @@ def parse_ice_table_robust(text):
                     break
             if re.fullmatch(r'\d{9,}', part): is_ignore = True
             if not is_ignore: candidate_parts.append(part)
-        
         if candidate_parts:
             final_parts = [p for p in candidate_parts if len(p) > 1 or re.match(r'[A-Za-z0-9]', p)]
             test_name = " ".join(final_parts)
@@ -251,38 +242,25 @@ def backup_existing_file(target_path):
         counter += 1
 
 def save_to_temp_structure(file_bytes, filename, mapping, root_path, logs):
-    """
-    一時ディレクトリ内にフォルダ構造を作って保存するロジック
-    """
     target_code = None
     for code in mapping.keys():
         if filename.endswith(f"{code}.pdf"):
             target_code = code
             break
-    
     if not target_code:
         logs.append(f"⚠️ スキップ (コード不一致): {filename}")
         return
-
     tests = mapping[target_code]
-    
-    # 重複チェック
     if len(tests) > 1:
         normalized_names = set([normalize_folder_name(t) for t in tests])
         if len(normalized_names) > 1:
             manual_folder = root_path / "_⚠️重複・手動仕分け" / target_code
             manual_folder.mkdir(parents=True, exist_ok=True)
             target_path = manual_folder / f"{target_code}.pdf"
-            
-            # Temp内でも重複はありえる（ZIP内に同名がある場合など）
             if target_path.exists(): backup_existing_file(target_path)
-            
-            with open(target_path, "wb") as dest:
-                dest.write(file_bytes)
+            with open(target_path, "wb") as dest: dest.write(file_bytes)
             logs.append(f"⚠️ 重複隔離: {target_code}")
             return
-
-    # 通常処理
     raw_test_name = tests[0]
     folder_test_name = normalize_folder_name(raw_test_name)
     parent_match = re.search(r'^(.*?)(\s+英語|$)', folder_test_name)
@@ -290,25 +268,18 @@ def save_to_temp_structure(file_bytes, filename, mapping, root_path, logs):
         parent_name = parent_match.group(1).strip()
     else:
         parent_name = folder_test_name
-
     target_folder = root_path / parent_name / folder_test_name
     target_folder.mkdir(parents=True, exist_ok=True)
-    
     target_path = target_folder / f"{target_code}.pdf"
-    
     renamed = None
     if target_path.exists():
         renamed = backup_existing_file(target_path)
-    
-    with open(target_path, "wb") as dest:
-        dest.write(file_bytes)
-    
+    with open(target_path, "wb") as dest: dest.write(file_bytes)
     msg = f"✅ 配置: {target_code} -> {folder_test_name}"
     if renamed: msg += f" (旧: {renamed})"
     logs.append(msg)
 
 def create_zip_from_dir(dir_path):
-    """ディレクトリをZIP化してBytesIOで返す"""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, _, files in os.walk(dir_path):
@@ -321,19 +292,12 @@ def create_zip_from_dir(dir_path):
 
 def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
     logs = []
-    
-    # マッピング
     mapping = parse_ice_table_robust(text_data)
     if not mapping:
         return ["❌ ICEテキスト解析失敗"], None, None
-    
     logs.append(f"📋 {len(mapping)}件の情報を認識")
-
-    # 1. 一時ディレクトリで作業（クラウド/ローカル共通）
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        
-        # ファイル展開・配置
         try:
             if zip_file_obj:
                 with zipfile.ZipFile(zip_file_obj) as z:
@@ -345,52 +309,36 @@ def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
                 save_to_temp_structure(pdf_file_obj.read(), pdf_file_obj.name, mapping, temp_path, logs)
         except Exception as e:
             return [f"❌ ファイル処理エラー: {e}"], None, None
-
-        # 2. ZIP作成（ダウンロード用）
         zip_output = create_zip_from_dir(temp_path)
-
-        # 3. ローカル保存（Windowsかつ書き込み可能な場合のみ）
         local_saved_path = None
-        if os.name == 'nt' and local_base_path: # Windows check
+        if os.name == 'nt' and local_base_path: 
             try:
-                # パス調整
                 local_path_str = local_base_path.strip().strip('"').strip("'")
                 if local_path_str.lower() == "desktop":
                     dest_root = Path(os.path.expanduser("~/Desktop")) / "Answers"
                 else:
                     dest_root = Path(os.path.abspath(local_path_str))
-                
                 dest_root.mkdir(parents=True, exist_ok=True)
-                
-                # Tempから実ディレクトリへコピー (shutil.copytreeはフォルダがあるとエラーになるので工夫が必要)
-                # 今回は単純に walk して copy
                 for root, dirs, files in os.walk(temp_path):
                     for file in files:
                         src_file = Path(root) / file
                         rel_path = src_file.relative_to(temp_path)
                         dest_file = dest_root / rel_path
-                        
                         dest_file.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        # ローカルでもバックアップ処理
-                        if dest_file.exists():
-                            backup_existing_file(dest_file)
-                        
+                        if dest_file.exists(): backup_existing_file(dest_file)
                         shutil.copy2(src_file, dest_file)
-                
                 local_saved_path = str(dest_root)
                 logs.append(f"💾 ローカル保存完了: {local_saved_path}")
             except Exception as e:
-                logs.append(f"⚠️ ローカル保存スキップ (権限なし/クラウド環境): {e}")
-
+                logs.append(f"⚠️ ローカル保存スキップ: {e}")
         return logs, zip_output, local_saved_path
 
 # ==========================================
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv27", page_icon="🗂️", layout="wide")
-    st.title("🗂️ 添削くん v27 (ハイブリッド仕分け)")
+    st.set_page_config(page_title="添削くんv29", page_icon="📓", layout="wide")
+    st.title("📓 添削くん v29 (修正済)")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -447,17 +395,14 @@ def main():
     tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
     # ==========================================
-    # タブ0: 答案仕分け (v27)
+    # タブ0: 答案仕分け
     # ==========================================
     with tab_sort:
         st.subheader("🧹 ICE答案の自動仕分け")
         st.caption("ローカル環境なら指定フォルダへ保存、Web環境ならZIPダウンロードが可能です。")
-        
         base_dir_input = st.text_input("保存先の親フォルダ (ローカル実行時のみ有効)", value=DEFAULT_BASE_DIR)
-        
         st.markdown("---")
         sort_mode = st.radio("モード選択", ["一括 (ZIPファイル)", "個別 (PDF単体)"], horizontal=True)
-        
         col_sort1, col_sort2 = st.columns(2)
         with col_sort1:
             st.markdown("**1. ICEの表をコピペ**")
@@ -474,34 +419,18 @@ def main():
                 st.error("テキストとファイルの両方が必要です。")
             else:
                 with st.spinner("解析・仕分け中..."):
-                    # 処理実行
                     zip_obj = upload_file if sort_mode == "一括 (ZIPファイル)" else None
                     pdf_obj = upload_file if sort_mode == "個別 (PDF単体)" else None
-                    
                     logs, zip_result, local_path = sort_process_hybrid(zip_obj, pdf_obj, ice_text, base_dir_input)
-                    
-                    # 結果表示
                     if logs and "❌" in logs[0]:
                         st.error(logs[0])
                     else:
                         st.success("処理完了！")
-                        
-                        # ダウンロードボタン (全員用)
                         if zip_result:
-                            st.download_button(
-                                label="📦 仕分け結果をダウンロード (ZIP)",
-                                data=zip_result,
-                                file_name="Sorted_Answers.zip",
-                                mime="application/zip",
-                                type="primary"
-                            )
-                            if not local_path:
-                                st.info("ℹ️ Cloud環境のため、直接保存はできません。上のボタンからZIPをダウンロードしてください。")
-
-                        # ローカル保存結果 (ローカル用)
+                            st.download_button("📦 仕分け結果をダウンロード (ZIP)", zip_result, "Sorted_Answers.zip", "application/zip", type="primary")
+                            if not local_path: st.info("ℹ️ Cloud環境のため、直接保存はできません。上のボタンからZIPをダウンロードしてください。")
                         if local_path:
                             st.success(f"📂 PC内のフォルダにも保存しました: `{local_path}`")
-
                         with st.expander("詳細ログ", expanded=True):
                             for log in logs:
                                 if "❌" in log: st.error(log)
@@ -523,6 +452,11 @@ def main():
 
         st.markdown("---")
         st.subheader("2. ルール設定")
+        
+        # ★追加: 言語タイプ選択
+        st.markdown("##### 🔤 解答の言語タイプ (OCR精度に関わります)")
+        rule_lang_type = st.radio("解答言語", ["英語のみ", "日本語のみ", "英語・日本語混合"], horizontal=True, key="reg_lang")
+        
         col_rule1, col_rule2 = st.columns(2)
         with col_rule1:
             rule_slots = st.number_input("解答欄の数（0なら自動）", min_value=0, value=0)
@@ -533,7 +467,6 @@ def main():
             rule_strict_space = st.checkbox("記述スペース狭小（コメント短め）")
             
         rule_custom = st.text_area("特記事項 (カスタムプロンプト)", placeholder="例: 記号問題なので解説は不要。")
-        
         st.markdown("---")
         st.subheader("3. 採点メモ")
         rule_memos = st.text_area("自分用のメモ・コメント集", placeholder="・配点: 10点\n・よくあるミス...\n・コメント例...", height=150)
@@ -546,21 +479,18 @@ def main():
                 if unique_id in st.session_state.question_registry:
                     st.session_state.pending_overwrite_data = {
                         "id": unique_id, "files": r_files,
-                        "rules": {"slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
+                        "rules": {"lang_type": rule_lang_type, "slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
                                   "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space, "custom": rule_custom, "memos": rule_memos},
                         "univ": r_univ, "year": r_year, "q_num": r_qnum
                     }
                     st.rerun()
                 else:
                     all_imgs = []
-                    for f in r_files:
-                        all_imgs.extend(process_uploaded_file(f))
+                    for f in r_files: all_imgs.extend(process_uploaded_file(f))
                     b64_imgs = [pil_to_base64(img) for img in all_imgs]
-
                     st.session_state.question_registry[unique_id] = {
-                        "univ": r_univ, "year": r_year, "q_num": r_qnum,
-                        "images": b64_imgs,
-                        "rules": {"slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
+                        "univ": r_univ, "year": r_year, "q_num": r_qnum, "images": b64_imgs,
+                        "rules": {"lang_type": rule_lang_type, "slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
                                   "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space, "custom": rule_custom, "memos": rule_memos}
                     }
                     st.success(f"新規登録しました: {unique_id}")
@@ -571,12 +501,10 @@ def main():
             if col_conf1.button("はい、更新します"):
                 data = st.session_state.pending_overwrite_data
                 all_imgs = []
-                for f in data['files']:
-                    all_imgs.extend(process_uploaded_file(f))
+                for f in data['files']: all_imgs.extend(process_uploaded_file(f))
                 b64_imgs = [pil_to_base64(img) for img in all_imgs]
                 st.session_state.question_registry[data['id']] = {
-                    "univ": data['univ'], "year": data['year'], "q_num": data['q_num'],
-                    "images": b64_imgs, "rules": data['rules']
+                    "univ": data['univ'], "year": data['year'], "q_num": data['q_num'], "images": b64_imgs, "rules": data['rules']
                 }
                 st.session_state.pending_overwrite_data = None
                 st.success("更新しました！")
@@ -593,7 +521,6 @@ def main():
             if st.button("選択したデータを削除"):
                 st.session_state.pending_delete_id = target_id
                 st.rerun()
-
             if st.session_state.pending_delete_id:
                 st.error(f"⚠️ 本当に『{st.session_state.pending_delete_id}』を削除しますか？")
                 col_del1, col_del2 = st.columns(2)
@@ -620,7 +547,6 @@ def main():
             st.success("🎉 添削完了")
             st.markdown("---")
             st.markdown(st.session_state.latest_result)
-            
             st.markdown("---")
             st.subheader("💬 AIへの追加指示・質問")
             with st.form("followup_form"):
@@ -673,7 +599,8 @@ def main():
             st.subheader("1. 基準データを選択")
             input_mode = st.radio("入力方法", ["登録データから呼び出す", "手動でアップロード"], horizontal=True)
             selected_registry_data = None
-            
+            manual_lang_type = "英語のみ" # ★ここがFix箇所
+
             if input_mode == "登録データから呼び出す":
                 if not st.session_state.question_registry:
                     st.warning("登録データがありません。")
@@ -684,6 +611,13 @@ def main():
                         data = st.session_state.question_registry[selected_id]
                         selected_registry_data = data
                         st.info(f"選択中: {data['univ']} {data['year']} {data['q_num']}")
+                        rules = data['rules']
+                        rule_txts = [rules.get('lang_type', '英語のみ')]
+                        if rules['slots'] > 0: rule_txts.append(f"解答欄{rules['slots']}つ")
+                        if rules['ignore_grid']: rule_txts.append("格子線無視")
+                        if rules.get('has_word_limit', False): rule_txts.append("語数制限あり")
+                        st.caption(f"ルール: {', '.join(rule_txts)}")
+
                         if not st.session_state.registry_ref_img_cache:
                             imgs = [base64_to_pil(b64) for b64 in data['images']]
                             st.session_state.registry_ref_img_cache = imgs
@@ -691,6 +625,7 @@ def main():
                             for img in st.session_state.registry_ref_img_cache:
                                 st.image(img, use_container_width=True)
             else:
+                manual_lang_type = st.radio("解答言語タイプ (手動)", ["英語のみ", "日本語のみ", "英語・日本語混合"], horizontal=True)
                 ref_files = st.file_uploader("基準ファイル", type=["jpg","png","pdf"], key="ref_manual", accept_multiple_files=True)
                 if ref_files:
                     st.session_state.ref_img_cache = []
@@ -711,18 +646,31 @@ def main():
             if student_files:
                 if st.button("① 読み取りを開始 (OCR)", type="primary", use_container_width=True):
                     with st.spinner("ルールに基づいて読み取り中..."):
+                        
+                        ocr_prompt_base = ""
+                        target_lang = "英語のみ"
+                        
                         if selected_registry_data:
                             st.session_state.active_rules = selected_registry_data['rules']
                             st.session_state.active_memos = selected_registry_data['rules'].get('memos', "")
+                            target_lang = selected_registry_data['rules'].get('lang_type', "英語のみ")
                         else:
                             st.session_state.active_rules = None
                             st.session_state.active_memos = ""
+                            target_lang = manual_lang_type
+
+                        if target_lang == "英語のみ":
+                            ocr_prompt_base = "画像の英文を、スペルミスを含めて忠実にそのままテキスト化してください。解説不要。\n"
+                        elif target_lang == "日本語のみ":
+                            ocr_prompt_base = "画像の日本語の文章を忠実にテキスト化してください。縦書きの場合は横書きに直してください。解説不要。\n"
+                        else: 
+                            ocr_prompt_base = "画像の英文および日本語の文章を、両方とも忠実にテキスト化してください。解説不要。\n"
 
                         st.session_state.student_img_cache = []
                         for f in student_files:
                             st.session_state.student_img_cache.extend(process_uploaded_file(f))
                         
-                        ocr_prompt = "画像の英文を、スペルミスを含めて忠実にそのままテキスト化してください。解説不要。\n"
+                        ocr_prompt = ocr_prompt_base
                         if selected_registry_data:
                             rules = selected_registry_data['rules']
                             if rules['ignore_grid']:
