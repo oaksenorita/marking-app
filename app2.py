@@ -20,7 +20,8 @@ from collections import defaultdict
 # ★設定エリア
 # ==========================================
 GEMINI_API_KEY_DEFAULT = "" 
-GEMINI_MODEL_NAME = "gemini-flash-latest"
+GEMINI_MODEL_NAME = "gemini-flash-latest" # デフォルト (高速)
+GEMINI_PRO_MODEL_NAME = "gemini-1.5-pro-latest" # 高精度用
 OPENAI_MODEL_NAME = "gpt-4o-mini"
 USD_JPY_RATE = 155.0
 COST_INPUT_PER_1M = 0.15
@@ -28,6 +29,63 @@ COST_OUTPUT_PER_1M = 0.60
 
 # デフォルト保存先
 DEFAULT_BASE_DIR = r"C:\Users\seory\OneDrive\添削用フォルダ"
+
+# ==========================================
+# [cite_start]共通採点基準 (デフォルト値) [cite: 1, 2, 3, 10-17, 18-23, 24-30]
+# ==========================================
+DEFAULT_COMMON_CRITERIA = """
+【英語共通採点基準 (2025/08/11版)】
+基本は問題ごとの解答解説採点基準を参照し、そこに載っていない減点幅は以下の基準を参照すること。
+1. 減点方式の定義
+   - 減点方式A: 「文法・語法」(英作文・説明)、 「誤訳・訳し漏れ」(和訳・和文英訳)
+   - 減点方式B: 「表記法・スペルミス」、「語数過不足」(英作文・説明)、「誤字・脱字」(和訳・和文英訳)
+
+2. 配点別減点幅
+   - [配点 1~25点]: A=-1点, B=-1点
+   - [配点 26~50点]: A=-2点, B=-1点
+   - [配点 51~75点]: A=-3点, B=-2点
+   - [配点 76~100点]: A=-4点, B=-3点
+   - 以降25点毎にA,Bともに-1点ずつ追加
+
+3. 字数・語数制限
+   - 指定を守っていない(範囲外)解答は0点。
+   - 「○字以内」で超過した場合は0点。
+   - 「○字程度」は±1割まで許容。それ以上の増減は1字(語)につき減点方式Bで減点。
+   - 説明問題での字数不足は、内容欠落として扱い、字数不足自体の減点はしない。
+
+4. その他
+   - 客観式で重複不可なのに重複回答した場合は0点。
+   - 和文英訳: 解答例になくても内容が合っていれば許容。
+   - 自由英作文: 内容面(設問要求)→論証面(論理・一貫性)の順で採点。
+"""
+
+# ==========================================
+# デフォルトプロンプト (AIへの指示)
+# ==========================================
+DEFAULT_SYSTEM_PROMPT = """
+あなたは教育的配慮のできる英語教師です。
+提示された「生徒の答案」を「基準資料」および「共通採点基準」に基づいて添削・採点してください。
+
+【最重要：出力フォーマット制約】
+1. **マークダウンの太字（**）は使用しないでください。** 読みづらくなるため、プレーンテキストで出力してください。
+2. 各指摘の文末には、必ず全角スペースを空けて、減点幅とその根拠となる区分を明記してください。
+   - 形式: 「指摘内容。　(-点数, 根拠)」
+   - 良い例: 三単現のsが抜けています。　(-1)　（減点方式A）
+   - 良い例: スペルミスです。　（-1）　（減点方式B）
+
+【具体的な添削指示】
+1. **添削スタイル**:
+   - 画像に直接書き込めないため、テキスト上で「下線部(1)〜」のように該当箇所を引用し、番号を振って指摘してください。
+
+2. **各ミスの指摘について**:
+   - なぜその部分が誤りなのか（理由）、どう訂正すればよいのか（改善案）を丁寧に述べてください。
+
+3. **各問題ごとのコメント**:
+   - 間違いの指摘だけでなく、できている点（良い点）も必ず見つけてコメントしてください。
+
+4. **全体の総評**:
+   - 大問を通した総評コメント、今後の学習指針となるアドバイスを記述してください。
+"""
 
 # ==========================================
 # 初期化・セッション管理
@@ -63,39 +121,16 @@ if "pending_overwrite_data" not in st.session_state:
 if "pending_delete_id" not in st.session_state:
     st.session_state.pending_delete_id = None
 
-# デフォルトプロンプト
-DEFAULT_SYSTEM_PROMPT = """
-あなたは教育的配慮のできる英語教師です。
-提示された「生徒の答案」を「基準資料」に基づいて添削・採点してください。
+# 共通基準テキストの初期化
+if "common_criteria_text" not in st.session_state:
+    st.session_state.common_criteria_text = DEFAULT_COMMON_CRITERIA
 
-【最重要：添削の心構え】
-* コメントは言い方のきつい攻撃的なものには決してせずに、生徒がやる気を出せたり棘のないようなコメントにしてください。
-* 添削や採点をしてコメントを追加した答案は生徒の手元に返すということを念頭に置いてください。
-
-【具体的な添削指示】
-1. **添削スタイル**:
-   - 画像に直接書き込めないため、テキスト上で「下線部(1)〜」のように該当箇所を引用し、番号を振って指摘してください。
-   - 各指摘の下に、対応する修正・解説を記述してください。
-
-2. **各ミスの指摘について**:
-   - なぜその部分が誤りなのか（理由）
-   - どのように訂正すればよいのか（改善案）
-   - なぜそう訂正するのか（文法的・文脈的理由）
-   上記を丁寧に述べてください。
-
-3. **各問題ごとのコメント**:
-   - 間違いの指摘だけでなく、できている点（良い点）も必ず見つけてコメントしてください。
-
-4. **全体の総評**:
-   - 最後に、大問を通した総評コメントを記述してください。
-   - 全体を通して良かった点・改善点を挙げてください。
-   - 今後の学習指針となるアドバイスを提示してください。
-
-出力はMarkdown形式で見やすく整形してください。
-"""
+# 未保存フラグ
+if "unsaved_changes" not in st.session_state:
+    st.session_state.unsaved_changes = False
 
 # ==========================================
-# 関数群: 共通
+# 関数群
 # ==========================================
 def process_uploaded_file(uploaded_file):
     images = []
@@ -126,10 +161,18 @@ def pil_to_base64(img):
 def base64_to_pil(base64_str):
     return Image.open(io.BytesIO(base64.b64decode(base64_str)))
 
-def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text_label="テキスト情報"):
+def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text_label="テキスト情報", use_pro_model=False, force_openai=False):
+    # 0. OpenAI強制モード
+    if force_openai:
+        if not openai_key:
+            return "エラー: OpenAI強制モードですが、APIキーが未設定です。", "Error"
+        return call_openai(prompt_text, text_input, images, openai_key, text_label)
+
+    # 1. Gemini Try
+    target_model_name = GEMINI_PRO_MODEL_NAME if use_pro_model else GEMINI_MODEL_NAME
     try:
         genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        model = genai.GenerativeModel(target_model_name)
         request_content = [prompt_text]
         if text_input:
             request_content.append(f"\n\n【{text_label}】\n{text_input}")
@@ -143,16 +186,19 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
         }
         response = model.generate_content(request_content, safety_settings=safety_settings)
         if response.text:
-            return response.text, "Gemini (Free)"
+            return response.text, f"Gemini ({'Pro' if use_pro_model else 'Flash'})"
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "Quota" in error_msg or "limit" in error_msg.lower():
-            st.warning("⚠️ Gemini制限。OpenAIへ切り替えます...")
+            st.warning(f"⚠️ Gemini制限発生。OpenAIへ切り替えます...")
         else:
             st.warning(f"⚠️ Geminiエラー({error_msg})。OpenAIへ切り替えます...")
+        
+        return call_openai(prompt_text, text_input, images, openai_key, text_label)
 
+def call_openai(prompt_text, text_input, images, openai_key, text_label):
     if not openai_key:
-        return "エラー: OpenAI APIキー未設定。", "Error"
+        return "エラー: OpenAI APIキー未設定。バックアップ起動不可。", "Error"
 
     try:
         client = openai.OpenAI(api_key=openai_key)
@@ -185,15 +231,11 @@ def call_ai_hybrid(prompt_text, text_input, images, gemini_key, openai_key, text
     except Exception as e:
         return f"OpenAI失敗: {e}", "Error"
 
-# ==========================================
-# 関数群: 答案仕分け (Auto Sorter v27)
-# ==========================================
+# --- 答案仕分け用関数 (v27ベース) ---
 def parse_ice_table_robust(text):
     mapping = defaultdict(list)
     lines = text.strip().split('\n')
-    ignore_patterns = [
-        r'\d{4}/\d{2}/\d{2}', r'未対応|対応|完了|添削中|NaN', r'単元ジャンル別演習|過去問演習講座|答案練習講座', r'^\d+$', r'^\d+/\d+$', 
-    ]
+    ignore_patterns = [r'\d{4}/\d{2}/\d{2}', r'未対応|対応|完了|添削中|NaN', r'単元ジャンル別演習|過去問演習講座|答案練習講座', r'^\d+$', r'^\d+/\d+$']
     for line in lines:
         line = line.strip()
         if not line: continue
@@ -208,17 +250,14 @@ def parse_ice_table_robust(text):
             if part == student_code: continue
             is_ignore = False
             for pat in ignore_patterns:
-                if re.fullmatch(pat, part):
-                    is_ignore = True
-                    break
+                if re.fullmatch(pat, part): is_ignore = True; break
             if re.fullmatch(r'\d{9,}', part): is_ignore = True
             if not is_ignore: candidate_parts.append(part)
         if candidate_parts:
             final_parts = [p for p in candidate_parts if len(p) > 1 or re.match(r'[A-Za-z0-9]', p)]
             test_name = " ".join(final_parts)
             if len(test_name) > 3:
-                if test_name not in mapping[student_code]:
-                    mapping[student_code].append(test_name)
+                if test_name not in mapping[student_code]: mapping[student_code].append(test_name)
     return mapping
 
 def normalize_folder_name(test_name):
@@ -226,30 +265,22 @@ def normalize_folder_name(test_name):
     return clean_name.strip()
 
 def backup_existing_file(target_path):
-    if not target_path.exists():
-        return None
+    if not target_path.exists(): return None
     counter = 1
     while True:
         suffix = "_pre" if counter == 1 else f"_pre{counter}"
         backup_name = f"{target_path.stem}{suffix}{target_path.suffix}"
         backup_path = target_path.parent / backup_name
         if not backup_path.exists():
-            try:
-                target_path.rename(backup_path)
-                return backup_name
-            except OSError:
-                return None
+            try: target_path.rename(backup_path); return backup_name
+            except OSError: return None
         counter += 1
 
 def save_to_temp_structure(file_bytes, filename, mapping, root_path, logs):
     target_code = None
     for code in mapping.keys():
-        if filename.endswith(f"{code}.pdf"):
-            target_code = code
-            break
-    if not target_code:
-        logs.append(f"⚠️ スキップ (コード不一致): {filename}")
-        return
+        if filename.endswith(f"{code}.pdf"): target_code = code; break
+    if not target_code: logs.append(f"⚠️ スキップ (コード不一致): {filename}"); return
     tests = mapping[target_code]
     if len(tests) > 1:
         normalized_names = set([normalize_folder_name(t) for t in tests])
@@ -259,21 +290,16 @@ def save_to_temp_structure(file_bytes, filename, mapping, root_path, logs):
             target_path = manual_folder / f"{target_code}.pdf"
             if target_path.exists(): backup_existing_file(target_path)
             with open(target_path, "wb") as dest: dest.write(file_bytes)
-            logs.append(f"⚠️ 重複隔離: {target_code}")
-            return
+            logs.append(f"⚠️ 重複隔離: {target_code}"); return
     raw_test_name = tests[0]
     folder_test_name = normalize_folder_name(raw_test_name)
     parent_match = re.search(r'^(.*?)(\s+英語|$)', folder_test_name)
-    if parent_match:
-        parent_name = parent_match.group(1).strip()
-    else:
-        parent_name = folder_test_name
+    parent_name = parent_match.group(1).strip() if parent_match else folder_test_name
     target_folder = root_path / parent_name / folder_test_name
     target_folder.mkdir(parents=True, exist_ok=True)
     target_path = target_folder / f"{target_code}.pdf"
     renamed = None
-    if target_path.exists():
-        renamed = backup_existing_file(target_path)
+    if target_path.exists(): renamed = backup_existing_file(target_path)
     with open(target_path, "wb") as dest: dest.write(file_bytes)
     msg = f"✅ 配置: {target_code} -> {folder_test_name}"
     if renamed: msg += f" (旧: {renamed})"
@@ -293,8 +319,7 @@ def create_zip_from_dir(dir_path):
 def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
     logs = []
     mapping = parse_ice_table_robust(text_data)
-    if not mapping:
-        return ["❌ ICEテキスト解析失敗"], None, None
+    if not mapping: return ["❌ ICEテキスト解析失敗"], None, None
     logs.append(f"📋 {len(mapping)}件の情報を認識")
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -303,21 +328,16 @@ def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
                 with zipfile.ZipFile(zip_file_obj) as z:
                     for filename in z.namelist():
                         if not filename.endswith('.pdf'): continue
-                        with z.open(filename) as source:
-                            save_to_temp_structure(source.read(), filename, mapping, temp_path, logs)
+                        with z.open(filename) as source: save_to_temp_structure(source.read(), filename, mapping, temp_path, logs)
             elif pdf_file_obj:
                 save_to_temp_structure(pdf_file_obj.read(), pdf_file_obj.name, mapping, temp_path, logs)
-        except Exception as e:
-            return [f"❌ ファイル処理エラー: {e}"], None, None
+        except Exception as e: return [f"❌ ファイル処理エラー: {e}"], None, None
         zip_output = create_zip_from_dir(temp_path)
         local_saved_path = None
         if os.name == 'nt' and local_base_path: 
             try:
                 local_path_str = local_base_path.strip().strip('"').strip("'")
-                if local_path_str.lower() == "desktop":
-                    dest_root = Path(os.path.expanduser("~/Desktop")) / "Answers"
-                else:
-                    dest_root = Path(os.path.abspath(local_path_str))
+                dest_root = Path(os.path.expanduser("~/Desktop")) / "Answers" if local_path_str.lower() == "desktop" else Path(os.path.abspath(local_path_str))
                 dest_root.mkdir(parents=True, exist_ok=True)
                 for root, dirs, files in os.walk(temp_path):
                     for file in files:
@@ -329,16 +349,19 @@ def sort_process_hybrid(zip_file_obj, pdf_file_obj, text_data, local_base_path):
                         shutil.copy2(src_file, dest_file)
                 local_saved_path = str(dest_root)
                 logs.append(f"💾 ローカル保存完了: {local_saved_path}")
-            except Exception as e:
-                logs.append(f"⚠️ ローカル保存スキップ: {e}")
+            except Exception as e: logs.append(f"⚠️ ローカル保存スキップ: {e}")
         return logs, zip_output, local_saved_path
 
 # ==========================================
 # メイン処理
 # ==========================================
 def main():
-    st.set_page_config(page_title="添削くんv29", page_icon="📓", layout="wide")
-    st.title("📓 添削くん v29 (修正済)")
+    st.set_page_config(page_title="添削くんv31", page_icon="📓", layout="wide")
+    st.title("📓 添削くん v31 (共通基準統合・機能フルセット)")
+
+    # --- 未保存警告 ---
+    if st.session_state.unsaved_changes:
+        st.warning("⚠️ **【重要】登録データが変更されています。** サイドバーの「設定ファイルを保存」ボタンを押してJSONを保存してください！", icon="💾")
 
     # --- サイドバー ---
     with st.sidebar:
@@ -354,19 +377,28 @@ def main():
         openai_key = st.text_input("OpenAI API Key (予備)", value=default_openai, type="password")
         
         st.divider()
-        st.header("📊 Cost")
-        st.caption(f"Total: ${st.session_state.total_cost_usd:.4f}")
+        st.header("📜 共通採点基準 (編集可)")
+        st.caption("全問題に適用される共通ルールです。変更すると全添削に反映されます。")
+        common_criteria = st.text_area("共通基準内容", value=st.session_state.common_criteria_text, height=300)
+        # 変更検知
+        if common_criteria != st.session_state.common_criteria_text:
+            st.session_state.common_criteria_text = common_criteria
         
         st.divider()
         st.header("📥 データ管理")
-        st.warning("【注意】ブラウザを閉じると登録データは消えます。", icon="⚠️")
         
         if not st.session_state.question_registry:
             json_str = "{}"
         else:
             json_str = json.dumps(st.session_state.question_registry, ensure_ascii=False, indent=2)
             
-        st.download_button("設定ファイルを保存 (Export)", json_str, "marking_config.json", "application/json")
+        st.download_button(
+            label="設定ファイルを保存 (Export)",
+            data=json_str,
+            file_name="marking_config.json",
+            mime="application/json",
+            on_click=lambda: st.session_state.update({"unsaved_changes": False})
+        )
         
         uploaded_config = st.file_uploader("設定ファイルを読込 (Import)", type=["json"])
         if uploaded_config is not None:
@@ -374,23 +406,24 @@ def main():
                 try:
                     data = json.load(uploaded_config)
                     st.session_state.question_registry = data
+                    st.session_state.unsaved_changes = False
                     st.success("読み込みました！")
                     st.rerun()
                 except Exception as e:
                     st.error(f"読込エラー: {e}")
         
+        st.divider()
         if st.button("全リセット"):
             st.session_state.clear()
             st.rerun()
 
-        if st.session_state.draft_text and st.session_state.active_memos:
-            st.divider()
-            st.info("📖 **この問題の採点メモ**")
-            st.text_area("参照用", value=st.session_state.active_memos, height=300, disabled=True)
-
     if not gemini_key or gemini_key == "AIza...":
         st.warning("APIキーを入力してください。")
         return
+
+    # --- プロンプト編集機能の復活 ---
+    with st.expander("🛠️ プロンプト編集 (自分好みにAIへの指示を変更する)", expanded=False):
+        custom_prompt = st.text_area("AIへのシステム指示", value=DEFAULT_SYSTEM_PROMPT, height=300)
 
     tab_sort, tab_mark, tab_reg, tab_hist = st.tabs(["📂 答案仕分け", "📝 採点・添削", "⚙️ 基準データ登録", "🕒 履歴"])
 
@@ -399,7 +432,6 @@ def main():
     # ==========================================
     with tab_sort:
         st.subheader("🧹 ICE答案の自動仕分け")
-        st.caption("ローカル環境なら指定フォルダへ保存、Web環境ならZIPダウンロードが可能です。")
         base_dir_input = st.text_input("保存先の親フォルダ (ローカル実行時のみ有効)", value=DEFAULT_BASE_DIR)
         st.markdown("---")
         sort_mode = st.radio("モード選択", ["一括 (ZIPファイル)", "個別 (PDF単体)"], horizontal=True)
@@ -428,7 +460,6 @@ def main():
                         st.success("処理完了！")
                         if zip_result:
                             st.download_button("📦 仕分け結果をダウンロード (ZIP)", zip_result, "Sorted_Answers.zip", "application/zip", type="primary")
-                            if not local_path: st.info("ℹ️ Cloud環境のため、直接保存はできません。上のボタンからZIPをダウンロードしてください。")
                         if local_path:
                             st.success(f"📂 PC内のフォルダにも保存しました: `{local_path}`")
                         with st.expander("詳細ログ", expanded=True):
@@ -452,8 +483,6 @@ def main():
 
         st.markdown("---")
         st.subheader("2. ルール設定")
-        
-        # ★追加: 言語タイプ選択
         st.markdown("##### 🔤 解答の言語タイプ (OCR精度に関わります)")
         rule_lang_type = st.radio("解答言語", ["英語のみ", "日本語のみ", "英語・日本語混合"], horizontal=True, key="reg_lang")
         
@@ -493,7 +522,9 @@ def main():
                         "rules": {"lang_type": rule_lang_type, "slots": rule_slots, "ignore_grid": rule_ignore_grid, "ignore_header": rule_ignore_header,
                                   "has_word_limit": rule_has_word_limit, "strict_space": rule_strict_space, "custom": rule_custom, "memos": rule_memos}
                     }
+                    st.session_state.unsaved_changes = True # 変更フラグON
                     st.success(f"新規登録しました: {unique_id}")
+                    st.rerun()
         
         if st.session_state.pending_overwrite_data:
             st.warning(f"⚠️ データ『{st.session_state.pending_overwrite_data['id']}』は既に存在します。更新しますか？")
@@ -507,6 +538,7 @@ def main():
                     "univ": data['univ'], "year": data['year'], "q_num": data['q_num'], "images": b64_imgs, "rules": data['rules']
                 }
                 st.session_state.pending_overwrite_data = None
+                st.session_state.unsaved_changes = True # 変更フラグON
                 st.success("更新しました！")
                 st.rerun()
             if col_conf2.button("キャンセル"):
@@ -516,7 +548,8 @@ def main():
         if st.session_state.question_registry:
             st.markdown("---")
             st.subheader("📚 登録データの管理・削除")
-            reg_keys = list(st.session_state.question_registry.keys())
+            # ★変更: 名前順にソート
+            reg_keys = sorted(list(st.session_state.question_registry.keys()))
             target_id = st.selectbox("登録済みデータ一覧", reg_keys)
             if st.button("選択したデータを削除"):
                 st.session_state.pending_delete_id = target_id
@@ -527,6 +560,7 @@ def main():
                 if col_del1.button("削除実行"):
                     del st.session_state.question_registry[st.session_state.pending_delete_id]
                     st.session_state.pending_delete_id = None
+                    st.session_state.unsaved_changes = True # 変更フラグON
                     st.success("削除しました。")
                     st.rerun()
                 if col_del2.button("やめる"):
@@ -599,13 +633,14 @@ def main():
             st.subheader("1. 基準データを選択")
             input_mode = st.radio("入力方法", ["登録データから呼び出す", "手動でアップロード"], horizontal=True)
             selected_registry_data = None
-            manual_lang_type = "英語のみ" # ★ここがFix箇所
+            manual_lang_type = "英語のみ" 
 
             if input_mode == "登録データから呼び出す":
                 if not st.session_state.question_registry:
                     st.warning("登録データがありません。")
                 else:
-                    options = ["選択してください"] + list(st.session_state.question_registry.keys())
+                    # ★変更: 名前順にソート
+                    options = ["選択してください"] + sorted(list(st.session_state.question_registry.keys()))
                     selected_id = st.selectbox("問題を選択", options)
                     if selected_id != "選択してください":
                         data = st.session_state.question_registry[selected_id]
@@ -644,8 +679,15 @@ def main():
             st.divider()
 
             if student_files:
+                col_ocr1, col_ocr2 = st.columns(2)
+                with col_ocr1:
+                    use_pro_ocr = st.checkbox("🐢 高精度OCRモードを使う (Pro版)←使用不可", value=False)
+                with col_ocr2:
+                    # ★追加: OpenAI強制モード
+                    force_openai_ocr = st.checkbox("⚡ 最初からOpenAIを使う (Geminiスキップ)", value=False)
+
                 if st.button("① 読み取りを開始 (OCR)", type="primary", use_container_width=True):
-                    with st.spinner("ルールに基づいて読み取り中..."):
+                    with st.spinner(f"OCR処理中..."):
                         
                         ocr_prompt_base = ""
                         target_lang = "英語のみ"
@@ -682,7 +724,8 @@ def main():
                         
                         text_res, model_used = call_ai_hybrid(
                             prompt_text=ocr_prompt, text_input="", images=st.session_state.student_img_cache,
-                            gemini_key=gemini_key, openai_key=openai_key, text_label="画像"
+                            gemini_key=gemini_key, openai_key=openai_key, text_label="画像",
+                            use_pro_model=use_pro_ocr, force_openai=force_openai_ocr
                         )
                         st.session_state.draft_text = text_res
                         st.rerun()
@@ -723,13 +766,17 @@ def main():
             
             if st.button("② 添削を実行", type="primary", use_container_width=True):
                 with st.spinner("ルールに基づいて添削中..."):
+                    # カスタムプロンプトを使用
                     instruction_prefix = """
                     【⚠️ 重要指示：役割の厳格な区別】
                     1. 以下の「生徒の答案（採点対象）」というテキストのみを採点してください。
                     2. 添付されている画像はすべて「正解データ（基準資料）」です。
                     3. **絶対に画像を採点しないでください。**
                     """
-                    final_prompt = instruction_prefix + "\n" + DEFAULT_SYSTEM_PROMPT
+                    final_prompt = instruction_prefix + "\n" + custom_prompt
+
+                    # ★追加: 共通採点基準の注入
+                    final_prompt += f"\n\n【英語共通採点基準 (補助)】\n{st.session_state.common_criteria_text}"
 
                     if st.session_state.active_rules:
                         rules = st.session_state.active_rules
